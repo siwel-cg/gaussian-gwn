@@ -3,6 +3,7 @@ import { Pane } from 'tweakpane';
 import * as TweakpaneFileImportPlugin from 'tweakpane-plugin-file-import';
 import { default as get_renderer_gaussian, GaussianRenderer } from './gaussian-renderer';
 import { default as get_renderer_pointcloud } from './point-cloud-renderer';
+import { default as get_renderer_bb, BBRendererControls } from './bb-renderer';
 import { Camera, load_camera_presets} from '../camera/camera';
 import { CameraControl } from '../camera/camera-control';
 import { time, timeReturn } from '../utils/simple-console';
@@ -22,6 +23,7 @@ export default async function init(
   let renderers: { pointcloud?: Renderer, gaussian?: Renderer } = {};
   let gaussian_renderer: GaussianRenderer | undefined; 
   let pointcloud_renderer: Renderer | undefined; 
+  let bbRenderer: (Renderer & BBRendererControls) | undefined;
   let renderer: Renderer | undefined; 
   let cameras;
   
@@ -50,12 +52,37 @@ export default async function init(
     renderer: 'pointcloud',
     ply_file: '',
     cam_file: '',
+    show_bbox: true,
+    show_query: true,
+    grid_resolution: 10
   };
 
   const pane = new Pane({
     title: 'Config',
     expanded: true,
   });
+
+  const overlay_folder = pane.addFolder({ title: 'Overlay' });
+  overlay_folder.addInput(params, 'show_bbox', { label: 'Bounding Box' })
+    .on('change', (e) => {
+      bbRenderer?.setShowBBox(e.value);
+    });
+
+  overlay_folder.addInput(params, 'show_query', { label: 'Query Points' })
+    .on('change', (e) => {
+      bbRenderer?.setShowQuery(e.value);
+    });
+
+  overlay_folder.addInput(params, 'grid_resolution', {
+    label: 'Grid Res',
+    min: 2,
+    max: 50,
+    step: 1,
+  })
+  .on('change', (e) => {
+    bbRenderer?.setResolution(e.value);
+  });
+
   pane.registerPlugin(TweakpaneFileImportPlugin);
   {
     pane.addMonitor(params, 'fps', {
@@ -85,10 +112,11 @@ export default async function init(
         const pc = await load(uploadedFile, device); // THIS WHERE WE LOAD FILE
         control.setTarget(pc.centroid, pc.radius * 2.5);
         camera.update_buffer();
-
+        bbRenderer = get_renderer_bb(pc, device, presentation_format, camera.uniform_buffer);
         pointcloud_renderer = get_renderer_pointcloud(pc, device, presentation_format, camera.uniform_buffer);
         gaussian_renderer = get_renderer_gaussian(pc, device, presentation_format, camera.uniform_buffer);
         gaussian_renderer.setGaussianMultiplier(params.gaussian_multiplier);
+        
         renderers = {
           pointcloud: pointcloud_renderer,
           gaussian: gaussian_renderer,
@@ -157,6 +185,9 @@ export default async function init(
       const encoder = device.createCommandEncoder();
       const texture_view = context.getCurrentTexture().createView();
       renderer.frame(encoder, texture_view);
+      if (bbRenderer) {
+          bbRenderer.frame(encoder, texture_view);
+      }
       device.queue.submit([encoder.finish()]);
     }
     requestAnimationFrame(frame);

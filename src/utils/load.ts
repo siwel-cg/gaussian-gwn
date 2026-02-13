@@ -145,6 +145,8 @@ export async function load(file: string, device: GPUDevice) {
     gaussian_3d_buffer,
     sh_buffer,
     centroid,
-    radius
+    radius,
+    bbox_min: vec3.create(minX, minY, minZ),
+    bbox_max: vec3.create(maxX, maxY, maxZ),
   };
 }
