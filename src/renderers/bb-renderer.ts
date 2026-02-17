@@ -6,6 +6,8 @@ export interface BBRendererControls {
   setResolution: (res: number) => void;
   setShowBBox: (show: boolean) => void;
   setShowQuery: (show: boolean) => void;
+  setBounds: (minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number) => void;
+  getOriginalBounds: () => { min: number[], max: number[] };
 }
 
 export default function get_renderer_bb(
@@ -15,53 +17,67 @@ export default function get_renderer_bb(
   camera_buffer: GPUBuffer
 ): Renderer & BBRendererControls {
 
-  // --- Uniform data ---
-  // Layout (std140):
-  //  0: bb_min (vec3f) + pad
-  // 16: bb_max (vec3f) + pad
-  // 32: resolution (u32), show_bbox (u32), show_query (u32), pad
-  // 48: query_color (vec4f)
-  // 64: bbox_color (vec4f)
-  // total: 80 bytes
-
-  const UNIFORM_SIZE = 80;
+  const UNIFORM_SIZE = 96;
   const uniformData = new ArrayBuffer(UNIFORM_SIZE);
   const f32 = new Float32Array(uniformData);
   const u32 = new Uint32Array(uniformData);
+
+  let curMin = [pc.bbox_min[0], pc.bbox_min[1], pc.bbox_min[2]];
+  let curMax = [pc.bbox_max[0], pc.bbox_max[1], pc.bbox_max[2]];
+
+  function getPerAxisRes(): [number, number, number] {
+    const dx = curMax[0] - curMin[0];
+    const dy = curMax[1] - curMin[1];
+    const dz = curMax[2] - curMin[2];
+    const maxDim = Math.max(dx, dy, dz);
+    if (maxDim === 0) return [1, 1, 1];
+    const spacing = maxDim / resolution;
+    const rx = Math.max(1, Math.round(dx / spacing));
+    const ry = Math.max(1, Math.round(dy / spacing));
+    const rz = Math.max(1, Math.round(dz / spacing));
+    return [rx, ry, rz];
+  }
 
   let resolution = 10;
   let showBBox = true;
   let showQuery = true;
 
   function writeUniforms() {
-    // bb_min
-    f32[0] = pc.bbox_min[0];
-    f32[1] = pc.bbox_min[1];
-    f32[2] = pc.bbox_min[2];
+    const [rezX, rezY, rezZ] = getPerAxisRes();
+    
+    f32[0] = curMin[0];
+    f32[1] = curMin[1];
+    f32[2] = curMin[2];
     f32[3] = 0; // pad
     // bb_max
-    f32[4] = pc.bbox_max[0];
-    f32[5] = pc.bbox_max[1];
-    f32[6] = pc.bbox_max[2];
+    f32[4] = curMax[0];
+    f32[5] = curMax[1];
+    f32[6] = curMax[2];
     f32[7] = 0; // pad
-    // resolution, show flags
-    u32[8] = resolution;
-    u32[9] = showBBox ? 1 : 0;
-    u32[10] = showQuery ? 1 : 0;
-    u32[11] = 0; // pad
+    // per-axis resolution, show flags
+    u32[8] = rezX;
+    u32[9] = rezY;
+    u32[10] = rezZ;
+    u32[11] = showBBox ? 1 : 0;
+    // show_query + padding
+    u32[12] = showQuery ? 1 : 0;
+    u32[13] = 0;
+    u32[14] = 0;
+    u32[15] = 0;
     // query_color: cyan
-    f32[12] = 0.0;
-    f32[13] = 1.0;
-    f32[14] = 1.0;
-    f32[15] = 1.0;
-    // bbox_color: green
     f32[16] = 0.0;
     f32[17] = 1.0;
-    f32[18] = 0.0;
+    f32[18] = 1.0;
     f32[19] = 1.0;
+    // bbox_color: green
+    f32[20] = 0.0;
+    f32[21] = 1.0;
+    f32[22] = 0.0;
+    f32[23] = 1.0;
 
     device.queue.writeBuffer(bb_uniform_buffer, 0, uniformData);
   }
+
 
   const bb_uniform_buffer = device.createBuffer({
     label: 'bb overlay uniforms',
@@ -157,10 +173,11 @@ export default function get_renderer_bb(
     }
 
     if (showQuery) {
+      const [rezX, rezY, rezZ] = getPerAxisRes();
       pass.setPipeline(query_pipeline);
       pass.setBindGroup(0, query_camera_bg);
       pass.setBindGroup(1, query_bb_bg);
-      pass.draw(resolution * resolution * resolution);
+      pass.draw(rezX * rezY * rezZ);
     }
 
     pass.end();
@@ -183,6 +200,17 @@ export default function get_renderer_bb(
     setShowQuery(show: boolean) {
       showQuery = show;
       writeUniforms();
+    },
+    setBounds(minX: number, minY: number, minZ: number, maxX: number, maxY: number, maxZ: number) {
+      curMin = [minX, minY, minZ];
+      curMax = [maxX, maxY, maxZ];
+      writeUniforms();
+    },
+    getOriginalBounds() {
+      return {
+        min: [pc.bbox_min[0], pc.bbox_min[1], pc.bbox_min[2]],
+        max: [pc.bbox_max[0], pc.bbox_max[1], pc.bbox_max[2]],
+      };
     },
   };
 }

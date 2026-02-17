@@ -12,10 +12,14 @@ struct BBUniforms {
     _pad0: f32,
     bb_max: vec3<f32>,
     _pad1: f32,
-    resolution: u32,
+    res_x: u32,
+    res_y: u32,
+    res_z: u32,
     show_bbox: u32,
     show_query: u32,
     _pad2: u32,
+    _pad3: u32,
+    _pad4: u32,
     query_color: vec4<f32>,
     bbox_color: vec4<f32>,
 };
@@ -69,19 +73,17 @@ fn vs_bbox(@builtin(vertex_index) idx: u32) -> VertexOutput {
 fn vs_query(@builtin(vertex_index) idx: u32) -> VertexOutput {
     var out: VertexOutput;
 
-    let res = bb.resolution;
-    let total_per_layer = res * res;
+    let total_per_layer = bb.res_x * bb.res_y;
 
     let iz = idx / total_per_layer;
     let remainder = idx % total_per_layer;
-    let iy = remainder / res;
-    let ix = remainder % res;
+    let iy = remainder / bb.res_x;
+    let ix = remainder % bb.res_x;
 
-    // Normalize to [0, 1] with half-cell offset for centering
     let t = vec3<f32>(
-        (f32(ix) + 0.5) / f32(res),
-        (f32(iy) + 0.5) / f32(res),
-        (f32(iz) + 0.5) / f32(res),
+        (f32(ix) + 0.5) / f32(bb.res_x),
+        (f32(iy) + 0.5) / f32(bb.res_y),
+        (f32(iz) + 0.5) / f32(bb.res_z),
     );
 
     let pos = bb.bb_min + t * (bb.bb_max - bb.bb_min);

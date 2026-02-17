@@ -54,7 +54,13 @@ export default async function init(
     cam_file: '',
     show_bbox: true,
     show_query: true,
-    grid_resolution: 10
+    grid_resolution: 10,
+    bb_scale_x: 1.0,
+    bb_scale_y: 1.0,
+    bb_scale_z: 1.0,
+    bb_offset_x: 0.0,
+    bb_offset_y: 0.0,
+    bb_offset_z: 0.0
   };
 
   const pane = new Pane({
@@ -82,6 +88,19 @@ export default async function init(
   .on('change', (e) => {
     bbRenderer?.setResolution(e.value);
   });
+
+  overlay_folder.addInput(params, 'bb_scale_x', { label: 'Scale X', min: 0.1, max: 3.0 })
+    .on('change', () => updateBBTransform());
+  overlay_folder.addInput(params, 'bb_scale_y', { label: 'Scale Y', min: 0.1, max: 3.0 })
+    .on('change', () => updateBBTransform());
+  overlay_folder.addInput(params, 'bb_scale_z', { label: 'Scale Z', min: 0.1, max: 3.0 })
+    .on('change', () => updateBBTransform());
+  overlay_folder.addInput(params, 'bb_offset_x', { label: 'Offset X', min: -5.0, max: 5.0 })
+    .on('change', () => updateBBTransform());
+  overlay_folder.addInput(params, 'bb_offset_y', { label: 'Offset Y', min: -5.0, max: 5.0 })
+    .on('change', () => updateBBTransform());
+  overlay_folder.addInput(params, 'bb_offset_z', { label: 'Offset Z', min: -5.0, max: 5.0 })
+    .on('change', () => updateBBTransform());
 
   pane.registerPlugin(TweakpaneFileImportPlugin);
   {
@@ -153,7 +172,6 @@ export default async function init(
       'gaussian_multiplier',
       {min: 0, max: 1.5}
     ).on('change', (e) => {
-      //TODO: Bind constants to the gaussian renderer.
       gaussian_renderer.setGaussianMultiplier(e.value);
     });
 
@@ -177,6 +195,26 @@ export default async function init(
         break;
     }
   });
+
+  function updateBBTransform() {
+    if (!bbRenderer) return;
+    const { min, max } = bbRenderer.getOriginalBounds();
+    const cx = (min[0] + max[0]) / 2;
+    const cy = (min[1] + max[1]) / 2;
+    const cz = (min[2] + max[2]) / 2;
+    const hx = (max[0] - min[0]) / 2;
+    const hy = (max[1] - min[1]) / 2;
+    const hz = (max[2] - min[2]) / 2;
+
+    bbRenderer.setBounds(
+        cx + params.bb_offset_x - hx * params.bb_scale_x,
+        cy + params.bb_offset_y - hy * params.bb_scale_y,
+        cz + params.bb_offset_z - hz * params.bb_scale_z,
+        cx + params.bb_offset_x + hx * params.bb_scale_x,
+        cy + params.bb_offset_y + hy * params.bb_scale_y,
+        cz + params.bb_offset_z + hz * params.bb_scale_z,
+    );
+  }
 
   function frame() {
     if (ply_file_loaded && cam_file_loaded) {

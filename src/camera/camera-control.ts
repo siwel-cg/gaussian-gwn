@@ -177,7 +177,6 @@ export class CameraControl {
     const sensitivity = 0.005;
     this.yaw -= xDelta * sensitivity;
     this.pitch += yDelta * sensitivity;
-    console.log(`rotate called: xDelta=${xDelta}, yDelta=${yDelta}`);
     this.updateCamera();
   }
 
