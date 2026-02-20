@@ -82,7 +82,7 @@ export default async function init(
   overlay_folder.addInput(params, 'grid_resolution', {
     label: 'Grid Res',
     min: 2,
-    max: 50,
+    max: 100,
     step: 1,
   })
   .on('change', (e) => {
@@ -177,23 +177,28 @@ export default async function init(
 
   }
 
-  document.addEventListener('keydown', (event) => {
-    switch(event.key) {
-      case '0':
-      case '1':
-      case '2':
-      case '3':
-      case '4':
-      case '5':
-      case '6':
-      case '7':
-      case '8':
-      case '9':
-        const i = parseInt(event.key);
-        console.log(`set to camera preset ${i}`);
-        camera.set_preset(cameras[i]);
-        break;
-    }
+  // document.addEventListener('keydown', (event) => {
+  //   switch(event.key) {
+  //     case '0':
+  //     case '1':
+  //     case '2':
+  //     case '3':
+  //     case '4':
+  //     case '5':
+  //     case '6':
+  //     case '7':
+  //     case '8':
+  //     case '9':
+  //       const i = parseInt(event.key);
+  //       console.log(`set to camera preset ${i}`);
+  //       camera.set_preset(cameras[i]);
+  //       break;
+  //   }
+  // });
+
+  pane.addButton({ title: 'Compute GWN' }).on('click', () => {
+      bbRenderer.setGWNMode(true);
+      bbRenderer.runGWN();
   });
 
   function updateBBTransform() {

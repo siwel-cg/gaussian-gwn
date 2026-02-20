@@ -17,18 +17,16 @@ struct BBUniforms {
     res_z: u32,
     show_bbox: u32,
     show_query: u32,
+    gwn_mode: u32,   // 0 = flat color, 1 = GWN heatmap
+    point_size: f32, // billboard half-size in pixels
     _pad2: u32,
-    _pad3: u32,
-    _pad4: u32,
     query_color: vec4<f32>,
     bbox_color: vec4<f32>,
 };
 
-@group(0) @binding(0)
-var<uniform> camera: CameraUniforms;
-
-@group(1) @binding(0)
-var<uniform> bb: BBUniforms;
+@group(0) @binding(0) var<uniform> camera: CameraUniforms;
+@group(1) @binding(0) var<uniform> bb: BBUniforms;
+@group(2) @binding(0) var<storage, read> gwn_values: array<f32>;
 
 struct VertexOutput {
     @builtin(position) position: vec4<f32>,
@@ -36,11 +34,8 @@ struct VertexOutput {
 };
 
 // ---- Bounding Box Wireframe ----
-// 24 vertices = 12 edges * 2 endpoints
-// Using line-list topology
 
 fn bbox_corner(index: u32) -> vec3<f32> {
-    // 8 corners of the box, indexed by 3 bits
     return vec3<f32>(
         select(bb.bb_min.x, bb.bb_max.x, (index & 1u) != 0u),
         select(bb.bb_min.y, bb.bb_max.y, (index & 2u) != 0u),
@@ -48,13 +43,9 @@ fn bbox_corner(index: u32) -> vec3<f32> {
     );
 }
 
-// 12 edges as pairs of corner indices
 const EDGE_INDICES = array<u32, 24>(
-    // bottom face (y=0)
     0u, 1u,  1u, 3u,  3u, 2u,  2u, 0u,
-    // top face (y=1)
     4u, 5u,  5u, 7u,  7u, 6u,  6u, 4u,
-    // vertical edges
     0u, 4u,  1u, 5u,  2u, 6u,  3u, 7u,
 );
 
@@ -67,29 +58,60 @@ fn vs_bbox(@builtin(vertex_index) idx: u32) -> VertexOutput {
     return out;
 }
 
-// ---- Query Points Grid ----
+// ---- Colormap: maps [0,1] -> color ----
+// Cool-warm diverging: blue(0) -> white(0.5) -> red(1)
+fn gwn_colormap(t: f32) -> vec3<f32> {
+    let s = clamp(t, 0.0, 1.0);
+    // blue -> white -> red
+    let r = clamp(2.0 * s, 0.0, 1.0);
+    let b = clamp(2.0 * (1.0 - s), 0.0, 1.0);
+    let g = 1.0 - abs(2.0 * s - 1.0);
+    return vec3<f32>(r, g, b);
+}
+
+// ---- Query Points Grid (billboard quads) ----
+// 6 vertices per point (2 triangles). vertex_index / 6 = point index.
+
+const QUAD_OFFSETS = array<vec2<f32>, 6>(
+    vec2<f32>(-1.0, -1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>(-1.0,  1.0),
+    vec2<f32>( 1.0, -1.0),
+    vec2<f32>( 1.0,  1.0),
+);
 
 @vertex
-fn vs_query(@builtin(vertex_index) idx: u32) -> VertexOutput {
+fn vs_query(@builtin(vertex_index) vert_idx: u32) -> VertexOutput {
     var out: VertexOutput;
 
-    let total_per_layer = bb.res_x * bb.res_y;
+    let pt_idx  = vert_idx / 6u;
+    let corner  = vert_idx % 6u;
 
-    let iz = idx / total_per_layer;
-    let remainder = idx % total_per_layer;
-    let iy = remainder / bb.res_x;
-    let ix = remainder % bb.res_x;
+    let total_per_layer = bb.res_x * bb.res_y;
+    let iz = pt_idx / total_per_layer;
+    let rem = pt_idx % total_per_layer;
+    let iy = rem / bb.res_x;
+    let ix = rem % bb.res_x;
 
     let t = vec3<f32>(
         (f32(ix) + 0.5) / f32(bb.res_x),
         (f32(iy) + 0.5) / f32(bb.res_y),
         (f32(iz) + 0.5) / f32(bb.res_z),
     );
+    let world_pos = bb.bb_min + t * (bb.bb_max - bb.bb_min);
 
-    let pos = bb.bb_min + t * (bb.bb_max - bb.bb_min);
+    // Project center to clip space, then offset in NDC pixels
+    let clip = camera.proj * camera.view * vec4<f32>(world_pos, 1.0);
+    let offset = QUAD_OFFSETS[corner] * bb.point_size / camera.viewport;
+    out.position = vec4<f32>(clip.xy + offset * clip.w, clip.zw);
 
-    out.position = camera.proj * camera.view * vec4<f32>(pos, 1.0);
-    out.color = bb.query_color;
+    if (bb.gwn_mode == 1u && pt_idx < arrayLength(&gwn_values)) {
+        out.color = vec4<f32>(gwn_colormap(gwn_values[pt_idx]), 1.0);
+    } else {
+        out.color = bb.query_color;
+    }
+
     return out;
 }
 
