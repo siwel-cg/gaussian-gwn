@@ -1,6 +1,7 @@
 import { PointCloud } from '../utils/load';
 import bb_overlay_wgsl from '../shaders/bb-overlay.wgsl';
 import gwn_compute_wgsl from '../shaders/gwn_compute.wgsl';
+import precompute_wgsl from '../shaders/precompute.wgsl';
 import { Renderer } from './renderer';
 
 const GWN_WORKGROUP_SIZE = 64;
@@ -31,7 +32,7 @@ export default function get_renderer_bb(
   let showBBox   = true;
   let showQuery  = true;
   let gwnMode    = false;
-  let pointSize  = 4.0; // pixels
+  let pointSize  = 4.0;
 
   function getPerAxisRes(): [number, number, number] {
     const dx = curMax[0] - curMin[0];
@@ -52,14 +53,56 @@ export default function get_renderer_bb(
     return rx * ry * rz;
   }
 
-  // ---- BB Uniform buffer ----
-  // Layout (bytes 0-111, 7 × vec4):
-  //  [0]  bb_min.xyz + pad
-  //  [16] bb_max.xyz + pad
-  //  [32] res_x, res_y, res_z, show_bbox   (u32 × 4)
-  //  [48] show_query, gwn_mode, point_size(f32), pad
-  //  [64] query_color (vec4)
-  //  [80] bbox_color  (vec4)
+  // PRECOMPUTE PASS STUFF: PRE CALCS NORM AXIS, AREA 
+
+  const PRECOMPUTED_STRIDE = 32; // 8 × f32
+  const precomputed_buffer = device.createBuffer({
+    label: 'precomputed splat data',
+    size: pc.num_points * PRECOMPUTED_STRIDE,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  const precompute_num_buf = device.createBuffer({
+    label: 'precompute num_gaussians',
+    size: 4,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+  device.queue.writeBuffer(precompute_num_buf, 0, new Uint32Array([pc.num_points]));
+
+  const precompute_pipeline = device.createComputePipeline({
+    label: 'precompute-pipeline',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ label: 'precompute', code: precompute_wgsl }),
+      entryPoint: 'precompute',
+      constants: { workgroupSize: GWN_WORKGROUP_SIZE },
+    },
+  });
+
+  const precompute_bg = device.createBindGroup({
+    label: 'precompute-bg',
+    layout: precompute_pipeline.getBindGroupLayout(0),
+    entries: [
+      { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
+      { binding: 1, resource: { buffer: precomputed_buffer } },
+      { binding: 2, resource: { buffer: precompute_num_buf } },
+    ],
+  });
+
+  // RUN PRECOMPTUE
+  {
+    const dispatch = Math.ceil(pc.num_points / GWN_WORKGROUP_SIZE);
+    const encoder = device.createCommandEncoder({ label: 'precompute' });
+    const pass = encoder.beginComputePass();
+    pass.setPipeline(precompute_pipeline);
+    pass.setBindGroup(0, precompute_bg);
+    pass.dispatchWorkgroups(dispatch, 1, 1);
+    pass.end();
+    device.queue.submit([encoder.finish()]);
+  }
+
+  
+  // BB RENDER STUFF
   const UNIFORM_SIZE = 96;
   const uniformData  = new ArrayBuffer(UNIFORM_SIZE);
   const uf32 = new Float32Array(uniformData);
@@ -69,14 +112,16 @@ export default function get_renderer_bb(
     const [rx, ry, rz] = getPerAxisRes();
     uf32[0]  = curMin[0]; uf32[1]  = curMin[1]; uf32[2]  = curMin[2]; uf32[3]  = 0;
     uf32[4]  = curMax[0]; uf32[5]  = curMax[1]; uf32[6]  = curMax[2]; uf32[7]  = 0;
-    uu32[8]  = rx;        uu32[9]  = ry;        uu32[10] = rz;
-    uu32[11] = showBBox  ? 1 : 0;
+    uu32[8]  = rx;
+    uu32[9]  = ry;
+    uu32[10] = rz;
+    uu32[11] = showBBox ? 1 : 0;
     uu32[12] = showQuery ? 1 : 0;
-    uu32[13] = gwnMode   ? 1 : 0;
-    uf32[14] = pointSize;           // point_size — f32 written into u32 slot 14
+    uu32[13] = gwnMode ? 1 : 0;
+    uf32[14] = pointSize;
     uu32[15] = 0;
-    uf32[16] = 0.0; uf32[17] = 1.0; uf32[18] = 1.0; uf32[19] = 1.0; // query_color cyan
-    uf32[20] = 0.0; uf32[21] = 1.0; uf32[22] = 0.0; uf32[23] = 1.0; // bbox_color  green
+    uf32[16] = 0.0; uf32[17] = 1.0; uf32[18] = 1.0; uf32[19] = 1.0; // point color
+    uf32[20] = 0.0; uf32[21] = 1.0; uf32[22] = 0.0; uf32[23] = 1.0; // box color
     device.queue.writeBuffer(bb_uniform_buffer, 0, uniformData);
   }
 
@@ -86,18 +131,17 @@ export default function get_renderer_bb(
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
-  // ---- GWN value buffer ----
-  let maxQueryPoints = totalQueryPoints();
 
+  // GNW CALC STUFF
+  let maxQueryPoints = totalQueryPoints();
   let gwn_buffer = device.createBuffer({
     label: 'gwn values',
     size:  Math.max(4, maxQueryPoints * 4),
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
   });
 
-  // ---- GWN compute uniforms ----
   const gwn_uniform_buffer = device.createBuffer({
-    label: 'gwn uniforms', size: 32,
+    label: 'gwn uniforms', size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
   const gwn_bb_min_buffer = device.createBuffer({
@@ -122,7 +166,6 @@ export default function get_renderer_bb(
     device.queue.writeBuffer(gwn_grid_res_buffer, 0, new Uint32Array([rx, ry, rz, 0]));
   }
 
-  // ---- Compute pipeline ----
   const compute_pipeline = device.createComputePipeline({
     label: 'gwn-compute-pipeline',
     layout: 'auto',
@@ -138,12 +181,12 @@ export default function get_renderer_bb(
       label: 'gwn-compute-bg',
       layout: compute_pipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
-        { binding: 1, resource: { buffer: gwn_buffer            } },
-        { binding: 2, resource: { buffer: gwn_uniform_buffer    } },
-        { binding: 3, resource: { buffer: gwn_bb_min_buffer     } },
-        { binding: 4, resource: { buffer: gwn_bb_max_buffer     } },
-        { binding: 5, resource: { buffer: gwn_grid_res_buffer   } },
+        { binding: 0, resource: { buffer: precomputed_buffer } },  // <-- changed
+        { binding: 1, resource: { buffer: gwn_buffer } },
+        { binding: 2, resource: { buffer: gwn_uniform_buffer } },
+        { binding: 3, resource: { buffer: gwn_bb_min_buffer } },
+        { binding: 4, resource: { buffer: gwn_bb_max_buffer } },
+        { binding: 5, resource: { buffer: gwn_grid_res_buffer } },
       ],
     });
   }
@@ -165,23 +208,22 @@ export default function get_renderer_bb(
     }
   }
 
-  // ---- Render pipelines ----
+  // RENDER SETUP
   const render_module = device.createShaderModule({ code: bb_overlay_wgsl });
-
   const bbox_pipeline = device.createRenderPipeline({
     label: 'bbox wireframe',
     layout: 'auto',
-    vertex:    { module: render_module, entryPoint: 'vs_bbox' },
-    fragment:  { module: render_module, entryPoint: 'fs_main', targets: [{ format: presentation_format }] },
+    vertex:   { module: render_module, entryPoint: 'vs_bbox' },
+    fragment: { module: render_module, entryPoint: 'fs_main', targets: [{ format: presentation_format }] },
     primitive: { topology: 'line-list' },
   });
 
   const query_pipeline = device.createRenderPipeline({
     label: 'query point quads',
     layout: 'auto',
-    vertex:    { module: render_module, entryPoint: 'vs_query' },
-    fragment:  { module: render_module, entryPoint: 'fs_main', targets: [{ format: presentation_format }] },
-    primitive: { topology: 'triangle-list' },  // billboard quads = 6 verts each
+    vertex:   { module: render_module, entryPoint: 'vs_query' },
+    fragment: { module: render_module, entryPoint: 'fs_main', targets: [{ format: presentation_format }] },
+    primitive: { topology: 'triangle-list' },
   });
 
   const camera_bg_bbox = device.createBindGroup({
@@ -216,7 +258,6 @@ export default function get_renderer_bb(
   writeUniforms();
   writeGWNComputeUniforms();
 
-  // ---- GWN dispatch ----
   function runGWN() {
     ensureGWNBuffer();
     writeGWNComputeUniforms();
@@ -230,7 +271,7 @@ export default function get_renderer_bb(
     device.queue.submit([encoder.finish()]);
   }
 
-  // ---- Render ----
+  // RENDER
   function render(encoder: GPUCommandEncoder, texture_view: GPUTextureView) {
     if (!showBBox && !showQuery) return;
 
@@ -252,7 +293,7 @@ export default function get_renderer_bb(
       pass.setBindGroup(0, camera_bg_query);
       pass.setBindGroup(1, bb_bg_query);
       pass.setBindGroup(2, gwn_bg_query);
-      pass.draw(rx * ry * rz * 6); // 6 verts per billboard quad
+      pass.draw(rx * ry * rz * 6);
     }
 
     pass.end();
@@ -262,11 +303,11 @@ export default function get_renderer_bb(
     frame: (encoder, texture_view) => render(encoder, texture_view),
     camera_buffer,
 
-    setResolution(res)      { resolution = res;     writeUniforms(); },
-    setShowBBox(show)       { showBBox   = show;    writeUniforms(); },
-    setShowQuery(show)      { showQuery  = show;    writeUniforms(); },
-    setGWNMode(enabled)     { gwnMode    = enabled; writeUniforms(); },
-    setPointSize(px)        { pointSize  = px;      writeUniforms(); },
+    setResolution(res)  { resolution = res;     writeUniforms(); },
+    setShowBBox(show)   { showBBox   = show;    writeUniforms(); },
+    setShowQuery(show)  { showQuery  = show;    writeUniforms(); },
+    setGWNMode(enabled) { gwnMode    = enabled; writeUniforms(); },
+    setPointSize(px)    { pointSize  = px;      writeUniforms(); },
     runGWN,
 
     setBounds(minX, minY, minZ, maxX, maxY, maxZ) {
