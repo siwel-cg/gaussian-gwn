@@ -8,6 +8,7 @@ import { Camera, load_camera_presets} from '../camera/camera';
 import { CameraControl } from '../camera/camera-control';
 import { time, timeReturn } from '../utils/simple-console';
 
+
 export interface Renderer {
   frame: (encoder: GPUCommandEncoder, texture_view: GPUTextureView) => void,
   camera_buffer: GPUBuffer,
@@ -55,6 +56,7 @@ export default async function init(
     show_bbox: true,
     show_query: true,
     grid_resolution: 10,
+    num_cameras: 16,
     bb_scale_x: 1.0,
     bb_scale_y: 1.0,
     bb_scale_z: 1.0,
@@ -87,6 +89,16 @@ export default async function init(
   })
   .on('change', (e) => {
     bbRenderer?.setResolution(e.value);
+  });
+
+  overlay_folder.addInput(params, 'num_cameras', {
+    label: 'Orient Cams',
+    min: 4,
+    max: 64,
+    step: 2,
+  })
+  .on('change', (e) => {
+    bbRenderer?.setNumCameras(e.value);
   });
 
   overlay_folder.addInput(params, 'bb_scale_x', { label: 'Scale X', min: 0.1, max: 3.0 })

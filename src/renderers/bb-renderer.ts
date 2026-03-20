@@ -3,16 +3,20 @@ import bb_overlay_wgsl from '../shaders/bb-overlay.wgsl';
 import gwn_compute_wgsl from '../shaders/gwn_compute.wgsl';
 import precompute_wgsl from '../shaders/precompute.wgsl';
 import { Renderer } from './renderer';
+import { mat4, vec3 } from 'wgpu-matrix';
+import orient_depth_wgsl from '../shaders/orient_depth.wgsl';
+import orient_vote_wgsl from '../shaders/orient_vote.wgsl';
 
 const GWN_WORKGROUP_SIZE = 64;
 
 export interface BBRendererControls {
-  setResolution:  (res: number)  => void;
+  setResolution:  (res: number) => void;
   setShowBBox:    (show: boolean) => void;
   setShowQuery:   (show: boolean) => void;
   setGWNMode:     (enabled: boolean) => void;
-  setPointSize:   (px: number)   => void;
+  setPointSize:   (px: number) => void;
   runGWN:         () => void;
+  setNumCameras:  (n: number) => void;
   setBounds:      (minX: number, minY: number, minZ: number,
                    maxX: number, maxY: number, maxZ: number) => void;
   getOriginalBounds: () => { min: number[], max: number[] };
@@ -101,6 +105,214 @@ export default function get_renderer_bb(
     device.queue.submit([encoder.finish()]);
   }
 
+  // NORMAL CAMERA STUFF
+  const CAMERA_SPHERE_SCALE = 1.5;
+  const ORIENT_DEPTH_RES = 64;
+  const ORIENT_FOV = Math.PI / 2;
+  const ORIENT_NEAR = 0.01;
+  const ORIENT_FAR_SCALE = 4.0;
+
+  let numCameras = 16;
+
+  const BYTES_PER_CAMERA = 80; // 20 floats
+
+  function fibonacciSphere(n: number): [number, number, number][] {
+    const pts: [number, number, number][] = [];
+    const golden = (1 + Math.sqrt(5)) / 2;
+    for (let i = 0; i < n; i++) {
+      const theta = Math.acos(1 - 2 * (i + 0.5) / n);
+      const phi   = 2 * Math.PI * i / golden;
+      pts.push([
+        Math.sin(theta) * Math.cos(phi),
+        Math.sin(theta) * Math.sin(phi),
+        Math.cos(theta),
+      ]);
+    }
+    return pts;
+  }
+
+  function buildViewProj(eye: number[], target: number[], radius: number): Float32Array {
+    const dir = vec3.normalize(vec3.subtract(target, eye));
+    const dotUp = Math.abs(vec3.dot(dir, [0, 1, 0]));
+    const safeUp = dotUp > 0.99 ? [1, 0, 0] : [0, 1, 0];
+
+    const view = mat4.lookAt(eye, target, safeUp);
+    const proj = mat4.perspective(ORIENT_FOV, 1.0, ORIENT_NEAR, ORIENT_FAR_SCALE * radius);
+    return mat4.multiply(proj, view) as Float32Array;
+  }
+
+  let orient_camera_buffer: GPUBuffer;
+  let orient_camera_count_buffer: GPUBuffer;
+
+  function buildOrientCameras() {
+    const cx = pc.centroid[0], cy = pc.centroid[1], cz = pc.centroid[2];
+    const camRadius = CAMERA_SPHERE_SCALE * pc.radius;
+    const dirs = fibonacciSphere(numCameras);
+
+    const data = new Float32Array(numCameras * 20);
+    for (let i = 0; i < numCameras; i++) {
+      const [dx, dy, dz] = dirs[i];
+      const eye = [cx + dx * camRadius, cy + dy * camRadius, cz + dz * camRadius];
+      const target = [cx, cy, cz];
+      const vp = buildViewProj(eye, target, pc.radius);
+
+      const off = i * 20;
+      data.set(vp, off);
+      data[off + 16] = eye[0];
+      data[off + 17] = eye[1];
+      data[off + 18] = eye[2];
+      data[off + 19] = 0;
+    }
+
+    if (orient_camera_buffer) orient_camera_buffer.destroy();
+    orient_camera_buffer = device.createBuffer({
+      label: 'orient cameras',
+      size: data.byteLength,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(orient_camera_buffer, 0, data);
+
+    if (orient_camera_count_buffer) orient_camera_count_buffer.destroy();
+    orient_camera_count_buffer = device.createBuffer({
+      label: 'orient camera count',
+      size: 16,
+      usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+    });
+    device.queue.writeBuffer(orient_camera_count_buffer, 0,
+      new Uint32Array([numCameras, ORIENT_DEPTH_RES, 0, 0]));
+
+    console.log(`[bb-renderer] built ${numCameras} orientation cameras, radius=${camRadius.toFixed(3)}`);
+  }
+
+  buildOrientCameras();
+
+  // ORIENT NORMALS
+  const DEPTH_TOLERANCE = 0.02; // 2% of depth range
+
+  // Depth buffer: num_cameras * depth_res * depth_res u32s
+  function depthBufSize() {
+    return numCameras * ORIENT_DEPTH_RES * ORIENT_DEPTH_RES;
+  }
+
+  let orient_depth_buffer = device.createBuffer({
+    label: 'orient depth buf',
+    size: depthBufSize() * 4,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  // Params uniform: num_cameras, depth_res, num_splats, depth_tolerance
+  const orient_params_buffer = device.createBuffer({
+    label: 'orient params',
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  function writeOrientParams() {
+    const buf = new ArrayBuffer(16);
+    const u = new Uint32Array(buf);
+    const f = new Float32Array(buf);
+    u[0] = numCameras;
+    u[1] = ORIENT_DEPTH_RES;
+    u[2] = pc.num_points;
+    f[3] = DEPTH_TOLERANCE;
+    device.queue.writeBuffer(orient_params_buffer, 0, buf);
+  }
+  writeOrientParams();
+
+  // --- Depth splat pipeline ---
+  const orient_depth_pipeline = device.createComputePipeline({
+    label: 'orient-depth-pipeline',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ label: 'orient-depth', code: orient_depth_wgsl }),
+      entryPoint: 'depth_splat',
+      constants: { workgroupSize: GWN_WORKGROUP_SIZE },
+    },
+  });
+
+  // --- Vote pipeline ---
+  const orient_vote_pipeline = device.createComputePipeline({
+    label: 'orient-vote-pipeline',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ label: 'orient-vote', code: orient_vote_wgsl }),
+      entryPoint: 'orient_vote',
+      constants: { workgroupSize: GWN_WORKGROUP_SIZE },
+    },
+  });
+
+  let orient_depth_bg: GPUBindGroup;
+  let orient_vote_bg: GPUBindGroup;
+
+  function rebuildOrientBindGroups() {
+    orient_depth_bg = device.createBindGroup({
+      label: 'orient-depth-bg',
+      layout: orient_depth_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: precomputed_buffer } },
+        { binding: 1, resource: { buffer: orient_camera_buffer } },
+        { binding: 2, resource: { buffer: orient_params_buffer } },
+        { binding: 3, resource: { buffer: orient_depth_buffer } },
+      ],
+    });
+
+    orient_vote_bg = device.createBindGroup({
+      label: 'orient-vote-bg',
+      layout: orient_vote_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: precomputed_buffer } },
+        { binding: 1, resource: { buffer: orient_camera_buffer } },
+        { binding: 2, resource: { buffer: orient_params_buffer } },
+        { binding: 3, resource: { buffer: orient_depth_buffer } },
+      ],
+    });
+  }
+
+  function runNormalOrientation() {
+    // Clear depth buffer to 0xFFFFFFFF (max depth)
+    const clearData = new Uint32Array(depthBufSize());
+    clearData.fill(0xFFFFFFFF);
+    device.queue.writeBuffer(orient_depth_buffer, 0, clearData);
+
+    writeOrientParams();
+
+    const dispatch = Math.ceil(pc.num_points / GWN_WORKGROUP_SIZE);
+    const encoder = device.createCommandEncoder({ label: 'normal-orientation' });
+
+    // Pass 1: depth splat
+    const depthPass = encoder.beginComputePass();
+    depthPass.setPipeline(orient_depth_pipeline);
+    depthPass.setBindGroup(0, orient_depth_bg);
+    depthPass.dispatchWorkgroups(dispatch, 1, 1);
+    depthPass.end();
+
+    // Pass 2: vote + flip
+    const votePass = encoder.beginComputePass();
+    votePass.setPipeline(orient_vote_pipeline);
+    votePass.setBindGroup(0, orient_vote_bg);
+    votePass.dispatchWorkgroups(dispatch, 1, 1);
+    votePass.end();
+
+    device.queue.submit([encoder.finish()]);
+    console.log(`[bb-renderer] normal orientation: ${numCameras} cameras, ${pc.num_points} splats`);
+  }
+
+  // Rebuild bind groups and buffers when camera count changes
+  function onCamerasChanged() {
+    // Recreate depth buffer if camera count changed
+    orient_depth_buffer.destroy();
+    orient_depth_buffer = device.createBuffer({
+      label: 'orient depth buf',
+      size: depthBufSize() * 4,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    });
+    rebuildOrientBindGroups();
+  }
+
+  rebuildOrientBindGroups();
+
+  // Run orientation immediately after precompute
+  runNormalOrientation();
   
   // BB RENDER STUFF
   const UNIFORM_SIZE = 96;
@@ -303,11 +515,17 @@ export default function get_renderer_bb(
     frame: (encoder, texture_view) => render(encoder, texture_view),
     camera_buffer,
 
-    setResolution(res)  { resolution = res;     writeUniforms(); },
-    setShowBBox(show)   { showBBox   = show;    writeUniforms(); },
-    setShowQuery(show)  { showQuery  = show;    writeUniforms(); },
-    setGWNMode(enabled) { gwnMode    = enabled; writeUniforms(); },
-    setPointSize(px)    { pointSize  = px;      writeUniforms(); },
+    setResolution(res) { resolution = res; writeUniforms(); },
+    setShowBBox(show) { showBBox = show; writeUniforms(); },
+    setShowQuery(show) { showQuery = show; writeUniforms(); },
+    setGWNMode(enabled) { gwnMode = enabled; writeUniforms(); },
+    setPointSize(px) { pointSize = px; writeUniforms(); },
+    setNumCameras(n) {
+        numCameras = n;
+        buildOrientCameras();
+        onCamerasChanged();
+        runNormalOrientation();
+      },
     runGWN,
 
     setBounds(minX, minY, minZ, maxX, maxY, maxZ) {
