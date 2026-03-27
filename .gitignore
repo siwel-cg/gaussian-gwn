@@ -25,3 +25,4 @@ dist-ssr
 /.vite
 
 */scenes
+src/.claude/worktrees/sharp-mestorf/.claude/settings.local.json

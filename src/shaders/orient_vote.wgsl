@@ -30,6 +30,7 @@ struct OrientParams {
 @group(0) @binding(1) var<storage, read>       cameras   : array<OrientCamera>;
 @group(0) @binding(2) var<uniform>             params    : OrientParams;
 @group(0) @binding(3) var<storage, read>       depth_buf : array<u32>;
+@group(0) @binding(4) var<storage, read_write> vote_debug : array<vec4<f32>>;
 
 @compute @workgroup_size(workgroupSize, 1, 1)
 fn orient_vote(@builtin(global_invocation_id) gid: vec3<u32>) {
@@ -43,6 +44,9 @@ fn orient_vote(@builtin(global_invocation_id) gid: vec3<u32>) {
     let pixels_per_cam = res * res;
 
     var vote = 0.0;
+    var in_frustum_count = 0.0;
+    var depth_pass_count = 0.0;
+    var grazing_skip_count = 0.0;
 
     for (var c = 0u; c < params.num_cameras; c++) {
         let cam = cameras[c];
@@ -55,6 +59,8 @@ fn orient_vote(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (ndc.x < -1.0 || ndc.x > 1.0 ||
             ndc.y < -1.0 || ndc.y > 1.0 ||
             ndc.z < 0.0  || ndc.z > 1.0) { continue; }
+
+        in_frustum_count += 1.0;
 
         let px = u32(clamp((ndc.x * 0.5 + 0.5) * f32(res), 0.0, f32(res - 1u)));
         let py = u32(clamp((1.0 - (ndc.y * 0.5 + 0.5)) * f32(res), 0.0, f32(res - 1u)));
@@ -71,15 +77,24 @@ fn orient_vote(@builtin(global_invocation_id) gid: vec3<u32>) {
 
         if (my_depth > stored_depth + tolerance) { continue; }
 
-        // visible from this camera — cast weighted vote
-        let view_dir = normalize(cam.pos.xyz - vec3<f32>(s.px, s.py, s.pz));
+        depth_pass_count += 1.0;
 
-        // dot(normal, view_dir) gives sign (keep/flip) and confidence (face-on vs grazing)
-        vote += dot(normal, view_dir);
+        let view_dir = normalize(cam.pos.xyz - vec3<f32>(s.px, s.py, s.pz));
+        let d = dot(normal, view_dir);
+
+        if (abs(d) < 0.1) {
+            grazing_skip_count += 1.0;
+            continue;
+        }
+
+        vote += d;
     }
 
+    // write debug info: vote, in_frustum, depth_passes, grazing_skips
+    vote_debug[splat_idx] = vec4<f32>(vote, in_frustum_count, depth_pass_count, grazing_skip_count);
+
     // flip normal if consensus says it's backwards
-    if (vote > 0.0) {
+    if (vote < 0.0) {
         splats[splat_idx].nx = -s.nx;
         splats[splat_idx].ny = -s.ny;
         splats[splat_idx].nz = -s.nz;

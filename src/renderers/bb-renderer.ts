@@ -13,6 +13,7 @@ export interface BBRendererControls {
   setResolution:  (res: number) => void;
   setShowBBox:    (show: boolean) => void;
   setShowQuery:   (show: boolean) => void;
+  setShowCameras: (show: boolean) => void;
   setGWNMode:     (enabled: boolean) => void;
   setPointSize:   (px: number) => void;
   runGWN:         () => void;
@@ -37,6 +38,7 @@ export default function get_renderer_bb(
   let showQuery  = true;
   let gwnMode    = false;
   let pointSize  = 4.0;
+  let showCameras = false;
 
   function getPerAxisRes(): [number, number, number] {
     const dx = curMax[0] - curMin[0];
@@ -93,8 +95,8 @@ export default function get_renderer_bb(
     ],
   });
 
-  // RUN PRECOMPTUE
-  {
+  // RUN PRECOMPUTE
+  function runPrecompute() {
     const dispatch = Math.ceil(pc.num_points / GWN_WORKGROUP_SIZE);
     const encoder = device.createCommandEncoder({ label: 'precompute' });
     const pass = encoder.beginComputePass();
@@ -104,10 +106,11 @@ export default function get_renderer_bb(
     pass.end();
     device.queue.submit([encoder.finish()]);
   }
+  runPrecompute();
 
   // NORMAL CAMERA STUFF
   const CAMERA_SPHERE_SCALE = 1.5;
-  const ORIENT_DEPTH_RES = 64;
+  const ORIENT_DEPTH_RES = 16;
   const ORIENT_FOV = Math.PI / 2;
   const ORIENT_NEAR = 0.01;
   const ORIENT_FAR_SCALE = 4.0;
@@ -187,7 +190,7 @@ export default function get_renderer_bb(
   buildOrientCameras();
 
   // ORIENT NORMALS
-  const DEPTH_TOLERANCE = 0.02; // 2% of depth range
+  const DEPTH_TOLERANCE = 0.0005;
 
   // Depth buffer: num_cameras * depth_res * depth_res u32s
   function depthBufSize() {
@@ -197,7 +200,7 @@ export default function get_renderer_bb(
   let orient_depth_buffer = device.createBuffer({
     label: 'orient depth buf',
     size: depthBufSize() * 4,
-    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
   });
 
   // Params uniform: num_cameras, depth_res, num_splats, depth_tolerance
@@ -218,6 +221,25 @@ export default function get_renderer_bb(
     device.queue.writeBuffer(orient_params_buffer, 0, buf);
   }
   writeOrientParams();
+
+  // Debug buffer for vote readback (vec4<f32> per splat: vote, in_frustum, depth_passes, grazing_skips)
+  const vote_debug_buffer = device.createBuffer({
+    label: 'vote debug',
+    size: pc.num_points * 16,
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC,
+  });
+  const vote_debug_staging = device.createBuffer({
+    label: 'vote debug staging',
+    size: pc.num_points * 16,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
+
+  // Depth buffer staging for readback
+  let depth_debug_staging = device.createBuffer({
+    label: 'depth debug staging',
+    size: depthBufSize() * 4,
+    usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
+  });
 
   // --- Depth splat pipeline ---
   const orient_depth_pipeline = device.createComputePipeline({
@@ -264,6 +286,7 @@ export default function get_renderer_bb(
         { binding: 1, resource: { buffer: orient_camera_buffer } },
         { binding: 2, resource: { buffer: orient_params_buffer } },
         { binding: 3, resource: { buffer: orient_depth_buffer } },
+        { binding: 4, resource: { buffer: vote_debug_buffer } },
       ],
     });
   }
@@ -293,8 +316,85 @@ export default function get_renderer_bb(
     votePass.dispatchWorkgroups(dispatch, 1, 1);
     votePass.end();
 
+    // Copy debug data for readback
+    encoder.copyBufferToBuffer(vote_debug_buffer, 0, vote_debug_staging, 0, pc.num_points * 16);
+    encoder.copyBufferToBuffer(orient_depth_buffer, 0, depth_debug_staging, 0, depthBufSize() * 4);
+
     device.queue.submit([encoder.finish()]);
     console.log(`[bb-renderer] normal orientation: ${numCameras} cameras, ${pc.num_points} splats`);
+
+    // Async readback of vote debug data
+    readbackOrientDebug();
+  }
+
+  async function readbackOrientDebug() {
+    // --- Vote debug readback ---
+    await vote_debug_staging.mapAsync(GPUMapMode.READ);
+    const voteData = new Float32Array(vote_debug_staging.getMappedRange().slice(0));
+    vote_debug_staging.unmap();
+
+    let zeroFrustum = 0, zeroDepthPass = 0, flipped = 0;
+    let totalVote = 0, totalFrustum = 0, totalDepthPass = 0, totalGrazing = 0;
+    let minVote = Infinity, maxVote = -Infinity;
+
+    for (let i = 0; i < pc.num_points; i++) {
+      const vote       = voteData[i * 4 + 0];
+      const inFrustum  = voteData[i * 4 + 1];
+      const depthPasses = voteData[i * 4 + 2];
+      const grazingSkips = voteData[i * 4 + 3];
+
+      if (inFrustum === 0) zeroFrustum++;
+      if (depthPasses === 0) zeroDepthPass++;
+      if (vote < 0) flipped++;
+      totalVote += vote;
+      totalFrustum += inFrustum;
+      totalDepthPass += depthPasses;
+      totalGrazing += grazingSkips;
+      minVote = Math.min(minVote, vote);
+      maxVote = Math.max(maxVote, vote);
+    }
+
+    const n = pc.num_points;
+    console.log(`[orient-debug] === Vote Pass Results ===`);
+    console.log(`[orient-debug] Total splats: ${n}`);
+    console.log(`[orient-debug] Splats with 0 cameras in frustum: ${zeroFrustum}`);
+    console.log(`[orient-debug] Splats with 0 depth-test passes: ${zeroDepthPass}`);
+    console.log(`[orient-debug] Splats flipped (vote < 0): ${flipped}`);
+    console.log(`[orient-debug] Vote range: [${minVote.toFixed(4)}, ${maxVote.toFixed(4)}], avg: ${(totalVote / n).toFixed(4)}`);
+    console.log(`[orient-debug] Avg cameras in frustum per splat: ${(totalFrustum / n).toFixed(1)}`);
+    console.log(`[orient-debug] Avg cameras passing depth test: ${(totalDepthPass / n).toFixed(1)}`);
+    console.log(`[orient-debug] Avg grazing skips per splat: ${(totalGrazing / n).toFixed(1)}`);
+
+    // Log a few sample splats
+    console.log(`[orient-debug] --- Sample splats (first 10) ---`);
+    for (let i = 0; i < Math.min(10, n); i++) {
+      const v = voteData[i*4], fr = voteData[i*4+1], dp = voteData[i*4+2], gs = voteData[i*4+3];
+      console.log(`[orient-debug]   splat ${i}: vote=${v.toFixed(4)}, frustum=${fr}, depthPass=${dp}, grazing=${gs}`);
+    }
+
+    // --- Depth buffer readback ---
+    await depth_debug_staging.mapAsync(GPUMapMode.READ);
+    const depthData = new Uint32Array(depth_debug_staging.getMappedRange().slice(0));
+    depth_debug_staging.unmap();
+
+    const res = ORIENT_DEPTH_RES;
+    const pixPerCam = res * res;
+    console.log(`[orient-debug] === Per-Camera Depth Coverage ===`);
+    for (let c = 0; c < numCameras; c++) {
+      let written = 0, minD = 0xFFFFFFFF, maxD = 0;
+      for (let p = 0; p < pixPerCam; p++) {
+        const d = depthData[c * pixPerCam + p];
+        if (d !== 0xFFFFFFFF) {
+          written++;
+          minD = Math.min(minD, d);
+          maxD = Math.max(maxD, d);
+        }
+      }
+      const coverage = (written / pixPerCam * 100).toFixed(1);
+      const minNdc = (minD / 16777215).toFixed(4);
+      const maxNdc = (maxD / 16777215).toFixed(4);
+      console.log(`[orient-debug]   cam ${c}: ${written}/${pixPerCam} pixels (${coverage}%), depth NDC [${written > 0 ? minNdc : 'N/A'}, ${written > 0 ? maxNdc : 'N/A'}]`);
+    }
   }
 
   // Rebuild bind groups and buffers when camera count changes
@@ -304,9 +404,17 @@ export default function get_renderer_bb(
     orient_depth_buffer = device.createBuffer({
       label: 'orient depth buf',
       size: depthBufSize() * 4,
-      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
+    });
+    // Recreate depth staging buffer to match new size
+    depth_debug_staging.destroy();
+    depth_debug_staging = device.createBuffer({
+      label: 'depth debug staging',
+      size: depthBufSize() * 4,
+      usage: GPUBufferUsage.MAP_READ | GPUBufferUsage.COPY_DST,
     });
     rebuildOrientBindGroups();
+    rebuildCamVisBindGroups();
   }
 
   rebuildOrientBindGroups();
@@ -438,6 +546,31 @@ export default function get_renderer_bb(
     primitive: { topology: 'triangle-list' },
   });
 
+  // Camera visualization pipeline
+  const cam_vis_pipeline = device.createRenderPipeline({
+    label: 'camera vis points',
+    layout: 'auto',
+    vertex:   { module: render_module, entryPoint: 'vs_cameras' },
+    fragment: { module: render_module, entryPoint: 'fs_main', targets: [{ format: presentation_format }] },
+    primitive: { topology: 'triangle-list' },
+  });
+
+  let camera_bg_camvis: GPUBindGroup;   // group 0 - camera uniforms
+  let orient_bg_camvis: GPUBindGroup;   // group 1 - orient camera data
+
+  function rebuildCamVisBindGroups() {
+    camera_bg_camvis = device.createBindGroup({
+      layout: cam_vis_pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: camera_buffer } }],
+    });
+    orient_bg_camvis = device.createBindGroup({
+      layout: cam_vis_pipeline.getBindGroupLayout(1),
+      entries: [
+        { binding: 1, resource: { buffer: orient_camera_buffer } },
+      ],
+    });
+  }
+
   const camera_bg_bbox = device.createBindGroup({
     layout: bbox_pipeline.getBindGroupLayout(0),
     entries: [{ binding: 0, resource: { buffer: camera_buffer } }],
@@ -467,6 +600,7 @@ export default function get_renderer_bb(
   }
 
   rebuildRenderBindGroups();
+  rebuildCamVisBindGroups();
   writeUniforms();
   writeGWNComputeUniforms();
 
@@ -485,7 +619,7 @@ export default function get_renderer_bb(
 
   // RENDER
   function render(encoder: GPUCommandEncoder, texture_view: GPUTextureView) {
-    if (!showBBox && !showQuery) return;
+    if (!showBBox && !showQuery && !showCameras) return;
 
     const pass = encoder.beginRenderPass({
       label: 'bb overlay render',
@@ -508,6 +642,13 @@ export default function get_renderer_bb(
       pass.draw(rx * ry * rz * 6);
     }
 
+    if (showCameras) {
+      pass.setPipeline(cam_vis_pipeline);
+      pass.setBindGroup(0, camera_bg_camvis);
+      pass.setBindGroup(1, orient_bg_camvis);
+      pass.draw(numCameras * 6);
+    }
+
     pass.end();
   }
 
@@ -518,10 +659,12 @@ export default function get_renderer_bb(
     setResolution(res) { resolution = res; writeUniforms(); },
     setShowBBox(show) { showBBox = show; writeUniforms(); },
     setShowQuery(show) { showQuery = show; writeUniforms(); },
+    setShowCameras(show) { showCameras = show; },
     setGWNMode(enabled) { gwnMode = enabled; writeUniforms(); },
     setPointSize(px) { pointSize = px; writeUniforms(); },
     setNumCameras(n) {
         numCameras = n;
+        runPrecompute();  // reset normals to fresh eigendecomposition before re-orienting
         buildOrientCameras();
         onCamerasChanged();
         runNormalOrientation();

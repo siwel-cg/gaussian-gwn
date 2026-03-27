@@ -57,6 +57,7 @@ export default async function init(
     show_query: true,
     grid_resolution: 10,
     num_cameras: 16,
+    show_cameras: false,
     bb_scale_x: 1.0,
     bb_scale_y: 1.0,
     bb_scale_z: 1.0,
@@ -90,6 +91,11 @@ export default async function init(
   .on('change', (e) => {
     bbRenderer?.setResolution(e.value);
   });
+
+  overlay_folder.addInput(params, 'show_cameras', { label: 'Show Cameras' })
+    .on('change', (e) => {
+      bbRenderer?.setShowCameras(e.value);
+    });
 
   overlay_folder.addInput(params, 'num_cameras', {
     label: 'Orient Cams',

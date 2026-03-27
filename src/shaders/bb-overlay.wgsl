@@ -115,6 +115,34 @@ fn vs_query(@builtin(vertex_index) vert_idx: u32) -> VertexOutput {
     return out;
 }
 
+// ---- Orient Camera Position Visualization (billboard quads) ----
+// Reads camera positions from orient camera buffer.
+// Each camera is 20 f32s: mat4x4 (16) + pos (4). Position at offset i*20 + 16.
+
+@group(1) @binding(1) var<storage, read> orient_cameras: array<f32>;
+
+@vertex
+fn vs_cameras(@builtin(vertex_index) vert_idx: u32) -> VertexOutput {
+    var out: VertexOutput;
+
+    let cam_idx = vert_idx / 6u;
+    let corner  = vert_idx % 6u;
+
+    let base = cam_idx * 20u + 16u;
+    let world_pos = vec3<f32>(
+        orient_cameras[base],
+        orient_cameras[base + 1u],
+        orient_cameras[base + 2u],
+    );
+
+    let clip = camera.proj * camera.view * vec4<f32>(world_pos, 1.0);
+    let cam_point_size = 6.0; // pixels
+    let offset = QUAD_OFFSETS[corner] * cam_point_size / camera.viewport;
+    out.position = vec4<f32>(clip.xy + offset * clip.w, clip.zw);
+    out.color = vec4<f32>(1.0, 1.0, 0.0, 1.0); // yellow
+    return out;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return in.color;
