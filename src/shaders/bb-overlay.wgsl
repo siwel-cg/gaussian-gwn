@@ -58,19 +58,47 @@ fn vs_bbox(@builtin(vertex_index) idx: u32) -> VertexOutput {
     return out;
 }
 
-// ---- Colormap: maps [0,1] -> color ----
-// Cool-warm diverging: blue(0) -> white(0.5) -> red(1)
-fn gwn_colormap(t: f32) -> vec3<f32> {
-    let s = clamp(t, 0.0, 1.0);
-    // blue -> white -> red
-    let r = clamp(2.0 * s, 0.0, 1.0);
-    let b = clamp(2.0 * (1.0 - s), 0.0, 1.0);
-    let g = 1.0 - abs(2.0 * s - 1.0);
-    return vec3<f32>(r, g, b);
-}
+// // ---- Colormap: maps [0,1] -> color ----
+// // Cool-warm diverging: blue(0) -> white(0.5) -> red(1)
+// fn gwn_colormap(t: f32) -> vec3<f32> {
+//     let s = clamp(t, 0.0, 1.0);
+//     // blue -> white -> red
+//     let r = clamp(2.0 * s, 0.0, 1.0);
+//     let b = clamp(2.0 * (1.0 - s), 0.0, 1.0);
+//     let g = 1.0 - abs(2.0 * s - 1.0);
+//     return vec3<f32>(r, g, b);
+// }
 
-// ---- Query Points Grid (billboard quads) ----
-// 6 vertices per point (2 triangles). vertex_index / 6 = point index.
+
+// ---- Colormap: maps [0, 2] -> color ----
+// 5-stop gradient:
+//   0.0  deep blue    (outside, GWN ≈ 0)
+//   0.5  cyan/teal    (approaching surface)
+//   1.0  bright green  (inside, GWN ≈ 1 — the "correct" value)
+//   1.5  yellow/orange (overshoot)
+//   2.0  hot red       (anomalous / double-winding)
+fn gwn_colormap(value: f32) -> vec3<f32> {
+    let t = clamp(value, 0.0, 2.0);
+
+    // 5 color stops
+    let c0 = vec3<f32>(0.05, 0.05, 0.40);  // deep blue
+    let c1 = vec3<f32>(0.10, 0.55, 0.65);  // teal
+    let c2 = vec3<f32>(0.30, 0.85, 0.20);  // bright green
+    let c3 = vec3<f32>(0.95, 0.75, 0.10);  // amber
+    let c4 = vec3<f32>(0.85, 0.10, 0.10);  // hot red
+
+    // piecewise linear interpolation across 4 segments over [0, 2]
+    // each segment spans 0.5 units
+    if (t < 0.5) {
+        return mix(c0, c1, t * 2.0);           // [0.0, 0.5)
+    } else if (t < 1.0) {
+        return mix(c1, c2, (t - 0.5) * 2.0);   // [0.5, 1.0)
+    } else if (t < 1.5) {
+        return mix(c2, c3, (t - 1.0) * 2.0);   // [1.0, 1.5)
+    } else {
+        return mix(c3, c4, (t - 1.5) * 2.0);   // [1.5, 2.0]
+    }
+}
 
 const QUAD_OFFSETS = array<vec2<f32>, 6>(
     vec2<f32>(-1.0, -1.0),
