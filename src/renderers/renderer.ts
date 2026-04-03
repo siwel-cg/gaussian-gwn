@@ -58,6 +58,8 @@ export default async function init(
     grid_resolution: 10,
     num_cameras: 16,
     show_cameras: false,
+    show_normals: false,
+    normal_length: 0.05,
     bb_scale_x: 1.0,
     bb_scale_y: 1.0,
     bb_scale_z: 1.0,
@@ -96,6 +98,21 @@ export default async function init(
     .on('change', (e) => {
       bbRenderer?.setShowCameras(e.value);
     });
+
+  overlay_folder.addInput(params, 'show_normals', { label: 'Show Normals' })
+    .on('change', (e) => {
+      bbRenderer?.setShowNormals(e.value);
+    });
+
+  overlay_folder.addInput(params, 'normal_length', {
+    label: 'Normal Len',
+    min: 0.01,
+    max: 0.5,
+    step: 0.01,
+  })
+  .on('change', (e) => {
+    bbRenderer?.setNormalLength(e.value);
+  });
 
   overlay_folder.addInput(params, 'num_cameras', {
     label: 'Orient Cams',

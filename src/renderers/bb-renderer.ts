@@ -14,6 +14,8 @@ export interface BBRendererControls {
   setShowBBox:    (show: boolean) => void;
   setShowQuery:   (show: boolean) => void;
   setShowCameras: (show: boolean) => void;
+  setShowNormals: (show: boolean) => void;
+  setNormalLength: (len: number) => void;
   setGWNMode:     (enabled: boolean) => void;
   setPointSize:   (px: number) => void;
   runGWN:         () => void;
@@ -39,6 +41,8 @@ export default function get_renderer_bb(
   let gwnMode    = false;
   let pointSize  = 4.0;
   let showCameras = false;
+  let showNormals = false;
+  let normalLength = 0.05;
 
   function getPerAxisRes(): [number, number, number] {
     const dx = curMax[0] - curMin[0];
@@ -555,6 +559,50 @@ export default function get_renderer_bb(
     primitive: { topology: 'triangle-list' },
   });
 
+  // Normal visualization pipeline
+  const normals_pipeline = device.createRenderPipeline({
+    label: 'normal vis lines',
+    layout: 'auto',
+    vertex:   { module: render_module, entryPoint: 'vs_normals' },
+    fragment: { module: render_module, entryPoint: 'fs_main', targets: [{ format: presentation_format }] },
+    primitive: { topology: 'line-list' },
+  });
+
+  const normal_vis_params_buffer = device.createBuffer({
+    label: 'normal vis params',
+    size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  function writeNormalVisParams() {
+    const buf = new ArrayBuffer(16);
+    const u = new Uint32Array(buf);
+    const f = new Float32Array(buf);
+    u[0] = pc.num_points;
+    f[1] = normalLength;
+    u[2] = 0;
+    u[3] = 0;
+    device.queue.writeBuffer(normal_vis_params_buffer, 0, buf);
+  }
+  writeNormalVisParams();
+
+  let camera_bg_normals: GPUBindGroup;
+  let data_bg_normals: GPUBindGroup;
+
+  function rebuildNormalsBindGroups() {
+    camera_bg_normals = device.createBindGroup({
+      layout: normals_pipeline.getBindGroupLayout(0),
+      entries: [{ binding: 0, resource: { buffer: camera_buffer } }],
+    });
+    data_bg_normals = device.createBindGroup({
+      layout: normals_pipeline.getBindGroupLayout(3),
+      entries: [
+        { binding: 0, resource: { buffer: precomputed_buffer } },
+        { binding: 1, resource: { buffer: normal_vis_params_buffer } },
+      ],
+    });
+  }
+
   let camera_bg_camvis: GPUBindGroup;   // group 0 - camera uniforms
   let orient_bg_camvis: GPUBindGroup;   // group 1 - orient camera data
 
@@ -601,6 +649,7 @@ export default function get_renderer_bb(
 
   rebuildRenderBindGroups();
   rebuildCamVisBindGroups();
+  rebuildNormalsBindGroups();
   writeUniforms();
   writeGWNComputeUniforms();
 
@@ -619,7 +668,7 @@ export default function get_renderer_bb(
 
   // RENDER
   function render(encoder: GPUCommandEncoder, texture_view: GPUTextureView) {
-    if (!showBBox && !showQuery && !showCameras) return;
+    if (!showBBox && !showQuery && !showCameras && !showNormals) return;
 
     const pass = encoder.beginRenderPass({
       label: 'bb overlay render',
@@ -649,6 +698,13 @@ export default function get_renderer_bb(
       pass.draw(numCameras * 6);
     }
 
+    if (showNormals) {
+      pass.setPipeline(normals_pipeline);
+      pass.setBindGroup(0, camera_bg_normals);
+      pass.setBindGroup(3, data_bg_normals);
+      pass.draw(pc.num_points * 2);
+    }
+
     pass.end();
   }
 
@@ -660,6 +716,8 @@ export default function get_renderer_bb(
     setShowBBox(show) { showBBox = show; writeUniforms(); },
     setShowQuery(show) { showQuery = show; writeUniforms(); },
     setShowCameras(show) { showCameras = show; },
+    setShowNormals(show) { showNormals = show; },
+    setNormalLength(len) { normalLength = len; writeNormalVisParams(); },
     setGWNMode(enabled) { gwnMode = enabled; writeUniforms(); },
     setPointSize(px) { pointSize = px; writeUniforms(); },
     setNumCameras(n) {

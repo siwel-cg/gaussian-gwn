@@ -171,6 +171,57 @@ fn vs_cameras(@builtin(vertex_index) vert_idx: u32) -> VertexOutput {
     return out;
 }
 
+// ---- Normal Direction Visualization (line segments) ----
+// Reads precomputed splat data (position + normal) and draws a line per splat.
+
+struct PrecomputedSplat {
+    nx: f32, ny: f32, nz: f32,
+    area: f32,
+    px: f32, py: f32, pz: f32,
+    _pad: f32,
+};
+
+struct NormalVisParams {
+    num_splats: u32,
+    normal_length: f32,
+    _pad0: u32,
+    _pad1: u32,
+};
+
+@group(3) @binding(0) var<storage, read> precomputed: array<PrecomputedSplat>;
+@group(3) @binding(1) var<uniform> normal_vis_params: NormalVisParams;
+
+@vertex
+fn vs_normals(@builtin(vertex_index) vert_idx: u32) -> VertexOutput {
+    var out: VertexOutput;
+
+    let splat_idx = vert_idx / 2u;
+    let is_tip    = vert_idx % 2u;  // 0 = base, 1 = tip
+
+    if (splat_idx >= normal_vis_params.num_splats) {
+        out.position = vec4<f32>(0.0, 0.0, 0.0, 1.0);
+        out.color = vec4<f32>(0.0);
+        return out;
+    }
+
+    let s = precomputed[splat_idx];
+    let pos = vec3<f32>(s.px, s.py, s.pz);
+    let normal = vec3<f32>(s.nx, s.ny, s.nz);
+
+    var world_pos = pos;
+    if (is_tip == 1u) {
+        world_pos = pos + normal * normal_vis_params.normal_length;
+    }
+
+    out.position = camera.proj * camera.view * vec4<f32>(world_pos, 1.0);
+
+    // Color-code by normal direction: RGB = abs(nx, ny, nz)
+    let abs_n = abs(normal);
+    out.color = vec4<f32>(abs_n.x, abs_n.y, abs_n.z, 1.0);
+
+    return out;
+}
+
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return in.color;
