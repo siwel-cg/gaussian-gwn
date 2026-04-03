@@ -23,7 +23,11 @@ struct OrientParams {
     num_cameras: u32,
     depth_res: u32,
     num_splats: u32,
-    depth_tolerance: f32,  // fractional tolerance, e.g. 0.02 = 2% of depth range
+    depth_tolerance: f32,
+    min_visibility_frac: f32,
+    min_opacity: f32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 @group(0) @binding(0) var<storage, read_write> splats    : array<PrecomputedSplat>;
@@ -99,4 +103,10 @@ fn orient_vote(@builtin(global_invocation_id) gid: vec3<u32>) {
         splats[splat_idx].ny = -s.ny;
         splats[splat_idx].nz = -s.nz;
     }
+
+    // visibility classification: mark splat as surface (1.0) or interior/artifact (0.0)
+    let opacity = s._pad;  // opacity was written by precompute pass
+    let min_passes = max(1.0, floor(f32(params.num_cameras) * params.min_visibility_frac));
+    let is_surface = depth_pass_count >= min_passes && opacity >= params.min_opacity;
+    splats[splat_idx]._pad = select(0.0, 1.0, is_surface);
 }

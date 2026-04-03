@@ -20,6 +20,8 @@ export interface BBRendererControls {
   setPointSize:   (px: number) => void;
   runGWN:         () => void;
   setNumCameras:  (n: number) => void;
+  setMinVisibilityFrac: (frac: number) => void;
+  setMinOpacity: (opacity: number) => void;
   setBounds:      (minX: number, minY: number, minZ: number,
                    maxX: number, maxY: number, maxZ: number) => void;
   getOriginalBounds: () => { min: number[], max: number[] };
@@ -43,6 +45,8 @@ export default function get_renderer_bb(
   let showCameras = false;
   let showNormals = false;
   let normalLength = 0.05;
+  let minVisibilityFrac = 0.1;
+  let minOpacity = 0.1;
 
   function getPerAxisRes(): [number, number, number] {
     const dx = curMax[0] - curMin[0];
@@ -207,21 +211,25 @@ export default function get_renderer_bb(
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
   });
 
-  // Params uniform: num_cameras, depth_res, num_splats, depth_tolerance
+  // Params uniform: num_cameras, depth_res, num_splats, depth_tolerance, min_visibility_frac, min_opacity, pad, pad
   const orient_params_buffer = device.createBuffer({
     label: 'orient params',
-    size: 16,
+    size: 32,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
   function writeOrientParams() {
-    const buf = new ArrayBuffer(16);
+    const buf = new ArrayBuffer(32);
     const u = new Uint32Array(buf);
     const f = new Float32Array(buf);
     u[0] = numCameras;
     u[1] = ORIENT_DEPTH_RES;
     u[2] = pc.num_points;
     f[3] = DEPTH_TOLERANCE;
+    f[4] = minVisibilityFrac;
+    f[5] = minOpacity;
+    u[6] = 0;
+    u[7] = 0;
     device.queue.writeBuffer(orient_params_buffer, 0, buf);
   }
   writeOrientParams();
@@ -727,6 +735,8 @@ export default function get_renderer_bb(
         onCamerasChanged();
         runNormalOrientation();
       },
+    setMinVisibilityFrac(frac) { minVisibilityFrac = frac; writeOrientParams(); },
+    setMinOpacity(op) { minOpacity = op; writeOrientParams(); },
     runGWN,
 
     setBounds(minX, minY, minZ, maxX, maxY, maxZ) {
