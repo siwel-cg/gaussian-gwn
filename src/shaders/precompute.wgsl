@@ -111,9 +111,6 @@ fn precompute(@builtin(global_invocation_id) gid: vec3<u32>) {
     let cd = unpack2x16float(g.pos_opacity[1]);
     let pos = vec3<f32>(ab.x, ab.y, cd.x);
 
-    // opacity (sigmoid of raw logit stored in cd.y)
-    let opacity = 1.0 / (1.0 + exp(-cd.y));
-
     // covariance → eigendecomposition
     let Sigma = build_covariance(g);
     let ev = sym3_eigenvalues(Sigma);
@@ -122,10 +119,13 @@ fn precompute(@builtin(global_invocation_id) gid: vec3<u32>) {
     // disk area from the two larger eigenvalues
     let area = 3.14159265 * sqrt(max(0.0, ev.y) * max(0.0, ev.z));
 
+    // flatness ratio: 0 = perfectly flat disk, 1 = sphere
+    let flatness = sqrt(ev.x / max(ev.y, 1e-12));
+
     precomputed[idx] = PrecomputedSplat(
         normal.x, normal.y, normal.z,
         area,
         pos.x, pos.y, pos.z,
-        opacity
+        flatness
     );
 }

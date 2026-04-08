@@ -6,6 +6,8 @@ import { Renderer } from './renderer';
 import { mat4, vec3 } from 'wgpu-matrix';
 import orient_depth_wgsl from '../shaders/orient_depth.wgsl';
 import orient_vote_wgsl from '../shaders/orient_vote.wgsl';
+import occupancy_compute_wgsl from '../shaders/occupancy_compute.wgsl';
+import fusion_compute_wgsl from '../shaders/fusion_compute.wgsl';
 
 const GWN_WORKGROUP_SIZE = 64;
 
@@ -20,8 +22,8 @@ export interface BBRendererControls {
   setPointSize:   (px: number) => void;
   runGWN:         () => void;
   setNumCameras:  (n: number) => void;
-  setMinVisibilityFrac: (frac: number) => void;
-  setMinOpacity: (opacity: number) => void;
+  setFlatnessThreshold: (t: number) => void;
+  setGamma: (g: number) => void;
   setBounds:      (minX: number, minY: number, minZ: number,
                    maxX: number, maxY: number, maxZ: number) => void;
   getOriginalBounds: () => { min: number[], max: number[] };
@@ -45,8 +47,8 @@ export default function get_renderer_bb(
   let showCameras = false;
   let showNormals = false;
   let normalLength = 0.05;
-  let minVisibilityFrac = 0.1;
-  let minOpacity = 0.1;
+  let flatnessThreshold = 0.3;
+  let gamma = 5.0;
 
   function getPerAxisRes(): [number, number, number] {
     const dx = curMax[0] - curMin[0];
@@ -211,25 +213,20 @@ export default function get_renderer_bb(
     usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST | GPUBufferUsage.COPY_SRC,
   });
 
-  // Params uniform: num_cameras, depth_res, num_splats, depth_tolerance, min_visibility_frac, min_opacity, pad, pad
   const orient_params_buffer = device.createBuffer({
     label: 'orient params',
-    size: 32,
+    size: 16,
     usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
   });
 
   function writeOrientParams() {
-    const buf = new ArrayBuffer(32);
+    const buf = new ArrayBuffer(16);
     const u = new Uint32Array(buf);
     const f = new Float32Array(buf);
     u[0] = numCameras;
     u[1] = ORIENT_DEPTH_RES;
     u[2] = pc.num_points;
     f[3] = DEPTH_TOLERANCE;
-    f[4] = minVisibilityFrac;
-    f[5] = minOpacity;
-    u[6] = 0;
-    u[7] = 0;
     device.queue.writeBuffer(orient_params_buffer, 0, buf);
   }
   writeOrientParams();
@@ -492,7 +489,14 @@ export default function get_renderer_bb(
   function writeGWNComputeUniforms() {
     const [rx, ry, rz] = getPerAxisRes();
     const nq = rx * ry * rz;
-    device.queue.writeBuffer(gwn_uniform_buffer,  0, new Uint32Array([pc.num_points, nq, 0, 0]));
+    const gwn_u = new ArrayBuffer(16);
+    const gwn_u32 = new Uint32Array(gwn_u);
+    const gwn_f32 = new Float32Array(gwn_u);
+    gwn_u32[0] = pc.num_points;
+    gwn_u32[1] = nq;
+    gwn_f32[2] = flatnessThreshold;
+    gwn_u32[3] = 0;
+    device.queue.writeBuffer(gwn_uniform_buffer, 0, gwn_u);
     device.queue.writeBuffer(gwn_bb_min_buffer,   0, new Float32Array([curMin[0], curMin[1], curMin[2], 0]));
     device.queue.writeBuffer(gwn_bb_max_buffer,   0, new Float32Array([curMax[0], curMax[1], curMax[2], 0]));
     device.queue.writeBuffer(gwn_grid_res_buffer, 0, new Uint32Array([rx, ry, rz, 0]));
@@ -525,6 +529,105 @@ export default function get_renderer_bb(
 
   let compute_bg = makeComputeBindGroup();
 
+  // --- Occupancy compute ---
+  const occ_uniform_buffer = device.createBuffer({
+    label: 'occ uniforms', size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  let maxOccPoints = totalQueryPoints();
+  let occ_buffer = device.createBuffer({
+    label: 'occ values',
+    size: Math.max(4, maxOccPoints * 4),
+    usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+  });
+
+  const occ_pipeline = device.createComputePipeline({
+    label: 'occupancy-compute-pipeline',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ label: 'occupancy-compute', code: occupancy_compute_wgsl }),
+      entryPoint: 'compute_occupancy',
+      constants: { workgroupSize: GWN_WORKGROUP_SIZE },
+    },
+  });
+
+  function writeOccUniforms() {
+    const [rx, ry, rz] = getPerAxisRes();
+    const nq = rx * ry * rz;
+    const buf = new ArrayBuffer(16);
+    const u = new Uint32Array(buf);
+    const f = new Float32Array(buf);
+    u[0] = pc.num_points;
+    u[1] = nq;
+    f[2] = flatnessThreshold;
+    f[3] = gamma;
+    device.queue.writeBuffer(occ_uniform_buffer, 0, buf);
+  }
+
+  function makeOccBindGroup() {
+    return device.createBindGroup({
+      label: 'occ-compute-bg',
+      layout: occ_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: pc.gaussian_3d_buffer } },
+        { binding: 1, resource: { buffer: precomputed_buffer } },
+        { binding: 2, resource: { buffer: occ_buffer } },
+        { binding: 3, resource: { buffer: occ_uniform_buffer } },
+        { binding: 4, resource: { buffer: gwn_bb_min_buffer } },
+        { binding: 5, resource: { buffer: gwn_bb_max_buffer } },
+        { binding: 6, resource: { buffer: gwn_grid_res_buffer } },
+      ],
+    });
+  }
+
+  let occ_bg = makeOccBindGroup();
+
+  // --- Fusion compute ---
+  const fusion_uniform_buffer = device.createBuffer({
+    label: 'fusion uniforms', size: 16,
+    usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST,
+  });
+
+  const fusion_pipeline = device.createComputePipeline({
+    label: 'fusion-compute-pipeline',
+    layout: 'auto',
+    compute: {
+      module: device.createShaderModule({ label: 'fusion-compute', code: fusion_compute_wgsl }),
+      entryPoint: 'fuse',
+      constants: { workgroupSize: GWN_WORKGROUP_SIZE },
+    },
+  });
+
+  function makeFusionBindGroup() {
+    return device.createBindGroup({
+      label: 'fusion-compute-bg',
+      layout: fusion_pipeline.getBindGroupLayout(0),
+      entries: [
+        { binding: 0, resource: { buffer: gwn_buffer } },
+        { binding: 1, resource: { buffer: occ_buffer } },
+        { binding: 2, resource: { buffer: fusion_uniform_buffer } },
+      ],
+    });
+  }
+
+  let fusion_bg = makeFusionBindGroup();
+
+  function ensureOccBuffer() {
+    const needed = totalQueryPoints();
+    if (needed > maxOccPoints) {
+      occ_buffer.destroy();
+      maxOccPoints = needed;
+      occ_buffer = device.createBuffer({
+        label: 'occ values',
+        size: maxOccPoints * 4,
+        usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
+      });
+      occ_bg = makeOccBindGroup();
+      fusion_bg = makeFusionBindGroup();
+    }
+  }
+
   function ensureGWNBuffer() {
     const needed = totalQueryPoints();
     if (needed > maxQueryPoints) {
@@ -536,6 +639,7 @@ export default function get_renderer_bb(
         usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
       });
       compute_bg = makeComputeBindGroup();
+      fusion_bg = makeFusionBindGroup();
       rebuildRenderBindGroups();
     }
   }
@@ -663,15 +767,41 @@ export default function get_renderer_bb(
 
   function runGWN() {
     ensureGWNBuffer();
+    ensureOccBuffer();
     writeGWNComputeUniforms();
-    const dispatch_x = Math.ceil(totalQueryPoints() / GWN_WORKGROUP_SIZE);
-    const encoder = device.createCommandEncoder({ label: 'gwn-compute' });
-    const pass = encoder.beginComputePass();
-    pass.setPipeline(compute_pipeline);
-    pass.setBindGroup(0, compute_bg);
-    pass.dispatchWorkgroups(dispatch_x, 1, 1);
-    pass.end();
+    writeOccUniforms();
+
+    const nq = totalQueryPoints();
+    const dispatch_x = Math.ceil(nq / GWN_WORKGROUP_SIZE);
+
+    // Write fusion uniforms
+    device.queue.writeBuffer(fusion_uniform_buffer, 0, new Uint32Array([nq, 0, 0, 0]));
+
+    const encoder = device.createCommandEncoder({ label: 'hybrid-gwn-compute' });
+
+    // Pass 1: W field (GWN from surface splats)
+    const gwnPass = encoder.beginComputePass();
+    gwnPass.setPipeline(compute_pipeline);
+    gwnPass.setBindGroup(0, compute_bg);
+    gwnPass.dispatchWorkgroups(dispatch_x, 1, 1);
+    gwnPass.end();
+
+    // Pass 2: O field (occupancy from fat splats)
+    const occPass = encoder.beginComputePass();
+    occPass.setPipeline(occ_pipeline);
+    occPass.setBindGroup(0, occ_bg);
+    occPass.dispatchWorkgroups(dispatch_x, 1, 1);
+    occPass.end();
+
+    // Pass 3: Fusion (combine W and O → write back to gwn_values)
+    const fusePass = encoder.beginComputePass();
+    fusePass.setPipeline(fusion_pipeline);
+    fusePass.setBindGroup(0, fusion_bg);
+    fusePass.dispatchWorkgroups(dispatch_x, 1, 1);
+    fusePass.end();
+
     device.queue.submit([encoder.finish()]);
+    console.log(`[bb-renderer] hybrid GWN: ${nq} query points, flatness_threshold=${flatnessThreshold}, gamma=${gamma}`);
   }
 
   // RENDER
@@ -735,8 +865,8 @@ export default function get_renderer_bb(
         onCamerasChanged();
         runNormalOrientation();
       },
-    setMinVisibilityFrac(frac) { minVisibilityFrac = frac; writeOrientParams(); },
-    setMinOpacity(op) { minOpacity = op; writeOrientParams(); },
+    setFlatnessThreshold(t) { flatnessThreshold = t; },
+    setGamma(g) { gamma = g; },
     runGWN,
 
     setBounds(minX, minY, minZ, maxX, maxY, maxZ) {

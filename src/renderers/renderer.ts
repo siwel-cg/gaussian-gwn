@@ -60,8 +60,8 @@ export default async function init(
     show_cameras: false,
     show_normals: false,
     normal_length: 0.05,
-    min_visibility_frac: 0.1,
-    min_opacity: 0.1,
+    flatness_threshold: 0.3,
+    gamma: 5.0,
     bb_scale_x: 1.0,
     bb_scale_y: 1.0,
     bb_scale_z: 1.0,
@@ -116,24 +116,24 @@ export default async function init(
     bbRenderer?.setNormalLength(e.value);
   });
 
-  overlay_folder.addInput(params, 'min_visibility_frac', {
-    label: 'Vis Threshold',
-    min: 0.0,
-    max: 0.5,
-    step: 0.05,
-  })
-  .on('change', (e) => {
-    bbRenderer?.setMinVisibilityFrac(e.value);
-  });
-
-  overlay_folder.addInput(params, 'min_opacity', {
-    label: 'Min Opacity',
+  overlay_folder.addInput(params, 'flatness_threshold', {
+    label: 'Flatness τ',
     min: 0.0,
     max: 1.0,
     step: 0.05,
   })
   .on('change', (e) => {
-    bbRenderer?.setMinOpacity(e.value);
+    bbRenderer?.setFlatnessThreshold(e.value);
+  });
+
+  overlay_folder.addInput(params, 'gamma', {
+    label: 'Occ Gamma',
+    min: 0.1,
+    max: 20.0,
+    step: 0.5,
+  })
+  .on('change', (e) => {
+    bbRenderer?.setGamma(e.value);
   });
 
   overlay_folder.addInput(params, 'num_cameras', {

@@ -11,7 +11,7 @@ struct PrecomputedSplat {
 struct GWNUniforms {
     num_gaussians: u32,
     num_query_pts: u32,
-    _pad0: u32,
+    flatness_threshold: f32,
     _pad1: u32,
 };
 
@@ -49,8 +49,8 @@ fn compute_gwn(@builtin(global_invocation_id) gid: vec3<u32>) {
     for (var i = 0u; i < gwn_uniforms.num_gaussians; i++) {
         let s = splats[i];
 
-        // skip interior/artifact splats (filtered by orient vote pass)
-        if (s._pad < 0.5) { continue; }
+        // skip fat (interior) splats — they contribute to occupancy field instead
+        if (s._pad > gwn_uniforms.flatness_threshold) { continue; }
 
         let p      = vec3<f32>(s.px, s.py, s.pz);
         let normal = vec3<f32>(s.nx, s.ny, s.nz);
