@@ -181,10 +181,12 @@ export default function get_renderer(
   });
 
   // INDIRECT DRAW BUFFER
+  // COPY_DST is required so we can copyBufferToBuffer the final keys_size into
+  // the instance_count slot after the preprocess pass completes.
   const indirect_buffer = device.createBuffer({
     label: 'indirect buffer',
     size: 16,
-    usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE,
+    usage: GPUBufferUsage.INDIRECT | GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     mappedAtCreation: true
   });
 
@@ -306,8 +308,20 @@ export default function get_renderer(
 
       const numGroups = Math.ceil(pc.num_points / 256);
       prepass.dispatchWorkgroups(numGroups, 1, 1);
-      prepass.dispatchWorkgroups(1, 1, 1);
+      // NOTE: the old second dispatch (1,1,1) was intended to let thread-0 safely read
+      // keys_size after all workgroups finished, but it also re-ran the full loop for
+      // gaussians 0..workgroupSize-1, injecting duplicate entries into the sort arrays.
+      // We removed it and instead use copyBufferToBuffer below (race-free, correct count).
       prepass.end();
+
+      // Copy the final visible-splat count from sort_info_buffer[0] (keys_size, u32) into
+      // indirect_buffer[4..8] (instance_count field of DrawIndirectArgs).
+      // This runs after the compute pass has fully retired on the GPU, so keys_size is final.
+      encoder.copyBufferToBuffer(
+        sorter.sort_info_buffer, 0,   // src: keys_size at offset 0
+        indirect_buffer, 4,           // dst: instance_count at byte offset 4
+        4                             // 4 bytes (one u32)
+      );
 
       sorter.sort(encoder);
 

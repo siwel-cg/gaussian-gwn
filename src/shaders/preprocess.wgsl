@@ -201,11 +201,11 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
     let viewPos = camera.view *  pos;
     let clipPos = camera.proj * viewPos;
 
-    // CULLING
-    if (clipPos.w  > 0.0 &&  
-        clipPos.x >= -clipPos.w * 1.2 && clipPos.x <= clipPos.w * 1.2 &&
-        clipPos.y >= -clipPos.w * 1.2 && clipPos.y <= clipPos.w * 1.2 && 
-        clipPos.z >= 0.0 && clipPos.z <= clipPos.w ) {
+    // CULLING: only depth-range cull (near/far).  XY is handled by the rasterizer,
+    // which is correct for large near-camera Gaussians whose center may sit outside
+    // a fixed frustum margin but whose quad still covers most of the screen.
+    if (clipPos.w > 0.0 &&
+        clipPos.z >= 0.0 && clipPos.z <= clipPos.w) {
         
         // CALCULATE COV
         let normRot = normalize(rot);
@@ -265,9 +265,10 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         //var Sigma2D = T * Sigma3D * transpose(T);
         var Sigma2D = J * Sigma3D_cam * transpose(J);
 
-        // Low-pass filter (in pixel space, 0.3 pixels is reasonable)
-        // Sigma2D[0][0] += 0.3;
-        // Sigma2D[1][1] += 0.3;
+        // Low-pass filter: ensure every splat is at least 0.3 px wide so
+        // sub-pixel Gaussians don't collapse to det≈0 and get discarded.
+        Sigma2D[0][0] += 0.3;
+        Sigma2D[1][1] += 0.3;
 
         let cov = vec3f(Sigma2D[0][0], Sigma2D[0][1], Sigma2D[1][1]);
         let det = (cov.x * cov.z - cov.y * cov.y);
@@ -307,7 +308,12 @@ fn preprocess(@builtin(global_invocation_id) gid: vec3<u32>, @builtin(num_workgr
         //splatList[idx].opacity = b.y;
         splatList[idx].opacity = 1.0 / (1.0 + exp(-b.y));
 
-        // STORE DEPTH AND INDICES FOR SORTING LATTER
+        // STORE DEPTH AND INDICES FOR SORTING
+        // The camera is left-handed (looks down +Z), so objects in front have viewPos.z > 0,
+        // meaning -viewPos.z < 0 (negative float, high bit set → mask = 0xFFFFFFFF).
+        // XORing a negative float bit-pattern with 0xFFFFFFFF inverts it, so that ascending
+        // radix sort naturally gives back-to-front (far first, near last) draw order.
+        // That is required for correct premultiplied-alpha: src:one, dst:one-minus-src-alpha.
         let u = bitcast<u32>(-viewPos.z);
         let mask = select(0xFFFFFFFFu, 0x80000000u, (u & 0x80000000u) == 0u);
         let depth_uint = u ^ mask;
