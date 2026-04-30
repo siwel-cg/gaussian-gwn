@@ -60,8 +60,6 @@ export default async function init(
     show_cameras: false,
     show_normals: false,
     normal_length: 0.05,
-    flatness_threshold: 0.3,
-    gamma: 5.0,
     bb_scale_x: 1.0,
     bb_scale_y: 1.0,
     bb_scale_z: 1.0,
@@ -114,26 +112,6 @@ export default async function init(
   })
   .on('change', (e) => {
     bbRenderer?.setNormalLength(e.value);
-  });
-
-  overlay_folder.addInput(params, 'flatness_threshold', {
-    label: 'Flatness τ',
-    min: 0.0,
-    max: 1.0,
-    step: 0.05,
-  })
-  .on('change', (e) => {
-    bbRenderer?.setFlatnessThreshold(e.value);
-  });
-
-  overlay_folder.addInput(params, 'gamma', {
-    label: 'Occ Gamma',
-    min: 0.1,
-    max: 20.0,
-    step: 0.5,
-  })
-  .on('change', (e) => {
-    bbRenderer?.setGamma(e.value);
   });
 
   overlay_folder.addInput(params, 'num_cameras', {

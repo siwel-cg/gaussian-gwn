@@ -22,8 +22,6 @@ export interface BBRendererControls {
   setPointSize:   (px: number) => void;
   runGWN:         () => void;
   setNumCameras:  (n: number) => void;
-  setFlatnessThreshold: (t: number) => void;
-  setGamma: (g: number) => void;
   setBounds:      (minX: number, minY: number, minZ: number,
                    maxX: number, maxY: number, maxZ: number) => void;
   getOriginalBounds: () => { min: number[], max: number[] };
@@ -47,8 +45,6 @@ export default function get_renderer_bb(
   let showCameras = false;
   let showNormals = false;
   let normalLength = 0.05;
-  let flatnessThreshold = 0.3;
-  let gamma = 5.0;
 
   function getPerAxisRes(): [number, number, number] {
     const dx = curMax[0] - curMin[0];
@@ -489,14 +485,12 @@ export default function get_renderer_bb(
   function writeGWNComputeUniforms() {
     const [rx, ry, rz] = getPerAxisRes();
     const nq = rx * ry * rz;
-    const gwn_u = new ArrayBuffer(16);
-    const gwn_u32 = new Uint32Array(gwn_u);
-    const gwn_f32 = new Float32Array(gwn_u);
-    gwn_u32[0] = pc.num_points;
-    gwn_u32[1] = nq;
-    gwn_f32[2] = flatnessThreshold;
-    gwn_u32[3] = 0;
-    device.queue.writeBuffer(gwn_uniform_buffer, 0, gwn_u);
+    // GWNUniforms: { num_gaussians, num_query_pts, _pad0, _pad1 } — 16 bytes.
+    // No flatness threshold any more (continuous s_i weighting handles classification).
+    device.queue.writeBuffer(
+      gwn_uniform_buffer, 0,
+      new Uint32Array([pc.num_points, nq, 0, 0])
+    );
     device.queue.writeBuffer(gwn_bb_min_buffer,   0, new Float32Array([curMin[0], curMin[1], curMin[2], 0]));
     device.queue.writeBuffer(gwn_bb_max_buffer,   0, new Float32Array([curMax[0], curMax[1], curMax[2], 0]));
     device.queue.writeBuffer(gwn_grid_res_buffer, 0, new Uint32Array([rx, ry, rz, 0]));
@@ -517,12 +511,14 @@ export default function get_renderer_bb(
       label: 'gwn-compute-bg',
       layout: compute_pipeline.getBindGroupLayout(0),
       entries: [
-        { binding: 0, resource: { buffer: precomputed_buffer } },  // <-- changed
+        { binding: 0, resource: { buffer: precomputed_buffer } },
         { binding: 1, resource: { buffer: gwn_buffer } },
         { binding: 2, resource: { buffer: gwn_uniform_buffer } },
         { binding: 3, resource: { buffer: gwn_bb_min_buffer } },
         { binding: 4, resource: { buffer: gwn_bb_max_buffer } },
         { binding: 5, resource: { buffer: gwn_grid_res_buffer } },
+        // GWN now reads alpha_i from the raw Gaussian buffer to apply opacity weighting.
+        { binding: 6, resource: { buffer: pc.gaussian_3d_buffer } },
       ],
     });
   }
@@ -555,14 +551,12 @@ export default function get_renderer_bb(
   function writeOccUniforms() {
     const [rx, ry, rz] = getPerAxisRes();
     const nq = rx * ry * rz;
-    const buf = new ArrayBuffer(16);
-    const u = new Uint32Array(buf);
-    const f = new Float32Array(buf);
-    u[0] = pc.num_points;
-    u[1] = nq;
-    f[2] = flatnessThreshold;
-    f[3] = gamma;
-    device.queue.writeBuffer(occ_uniform_buffer, 0, buf);
+    // OccUniforms: { num_gaussians, num_query_pts, _pad0, _pad1 } — 16 bytes.
+    // No gamma, no flatness threshold (running-product soft union is parameter-free).
+    device.queue.writeBuffer(
+      occ_uniform_buffer, 0,
+      new Uint32Array([pc.num_points, nq, 0, 0])
+    );
   }
 
   function makeOccBindGroup() {
@@ -658,7 +652,20 @@ export default function get_renderer_bb(
     label: 'query point quads',
     layout: 'auto',
     vertex:   { module: render_module, entryPoint: 'vs_query' },
-    fragment: { module: render_module, entryPoint: 'fs_main', targets: [{ format: presentation_format }] },
+    fragment: {
+      module: render_module,
+      entryPoint: 'fs_main',
+      targets: [{
+        format: presentation_format,
+        // Alpha blending so vs_query can use F as alpha — exterior points
+        // (F~0) become transparent and the visible structure is just the
+        // soft-OR fused interior region.
+        blend: {
+          color: { srcFactor: 'src-alpha', dstFactor: 'one-minus-src-alpha', operation: 'add' },
+          alpha: { srcFactor: 'one',       dstFactor: 'one-minus-src-alpha', operation: 'add' },
+        },
+      }],
+    },
     primitive: { topology: 'triangle-list' },
   });
 
@@ -801,7 +808,7 @@ export default function get_renderer_bb(
     fusePass.end();
 
     device.queue.submit([encoder.finish()]);
-    console.log(`[bb-renderer] hybrid GWN: ${nq} query points, flatness_threshold=${flatnessThreshold}, gamma=${gamma}`);
+    console.log(`[bb-renderer] soft-union W/O fusion: ${nq} query points (parameter-free)`);
   }
 
   // RENDER
@@ -865,8 +872,6 @@ export default function get_renderer_bb(
         onCamerasChanged();
         runNormalOrientation();
       },
-    setFlatnessThreshold(t) { flatnessThreshold = t; },
-    setGamma(g) { gamma = g; },
     runGWN,
 
     setBounds(minX, minY, minZ, maxX, maxY, maxZ) {

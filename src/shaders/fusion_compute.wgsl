@@ -1,7 +1,15 @@
-// fusion_compute.wgsl — Fuse winding number W(x) and occupancy O(x) into final field F(x).
+// fusion_compute.wgsl — Fuse W_tilde(x) and O(x) via soft OR (probabilistic union).
 //
-// W is primary (defines boundary). O is secondary (resolves ambiguity).
-// When W is confident (near 0 or 1), trust it. When ambiguous (near 0.5), use O.
+//     F(x) = 1 - (1 - W_tilde(x)) * (1 - O(x))
+//          = W_tilde + O - W_tilde * O
+//
+// Properties:
+//   • Both inputs are dimensionless in [0,1] → no manual scale factor needed.
+//   • If either source is confident "inside", F is high.
+//   • If both agree, F saturates toward 1.
+//   • If both are weak, F stays low.
+//
+// This replaces the old confidence-weighted blend.  No gamma, no flatness.
 
 override workgroupSize: u32 = 64;
 
@@ -21,12 +29,12 @@ fn fuse(@builtin(global_invocation_id) gid: vec3<u32>) {
     let idx = gid.x;
     if (idx >= fusion_uniforms.num_query_pts) { return; }
 
-    let w = gwn_values[idx];
-    let o = occ_values[idx];
+    // gwn_values already holds W_tilde (clamped in gwn_compute);
+    // occ_values is bounded in [0,1] by construction.  Extra clamp is
+    // defensive in case upstream invariants ever drift.
+    let w = clamp(gwn_values[idx], 0.0, 1.0);
+    let o = clamp(occ_values[idx], 0.0, 1.0);
 
-    // confidence: 1 when W near 0 or 1, 0 when W near 0.5
-    let confidence = 4.0 * (w - 0.5) * (w - 0.5);
-
-    // fuse: trust W when confident, blend toward O when ambiguous
-    gwn_values[idx] = confidence * w + (1.0 - confidence) * o;
+    // Soft OR: F = 1 - (1 - W)(1 - O)
+    gwn_values[idx] = 1.0 - (1.0 - w) * (1.0 - o);
 }

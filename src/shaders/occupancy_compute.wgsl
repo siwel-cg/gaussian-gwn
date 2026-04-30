@@ -1,8 +1,16 @@
-// occupancy_compute.wgsl — Compute occupancy field O(x) from fat (interior) splats.
+// occupancy_compute.wgsl — Interior (O) field via bounded soft union of Gaussian
+// membership kernels.  No gamma, no flatness threshold.
 //
-// For each query point, sums Gaussian density from splats with flatness > threshold.
-// Each fat splat contributes opacity * exp(-0.5 * mahalanobis_dist^2).
-// Output: O(x) = 1 - exp(-gamma * sum)
+// For each query point x, every splat contributes a bounded membership value
+//     o_i(x) = alpha_i * b_i * exp(-0.5 * d_i^2(x))         in [0,1]
+// where b_i = 1 - s_i is the blob-likeness (precomputed _pad holds s_i), and
+// d_i^2 is squared Mahalanobis distance.  The aggregate is the saturating
+// soft union (probabilistic OR):
+//     O(x) = 1 - prod_i (1 - o_i(x))
+// implemented per-query as a running product (occ_product *= (1 - o_i)),
+// then O = 1 - occ_product.  Bounded by construction.
+//
+// d_i^2 > 9 (3-sigma) splats are skipped — efficiency cutoff, not a parameter.
 
 override workgroupSize: u32 = 64;
 
@@ -16,14 +24,14 @@ struct PrecomputedSplat {
     nx: f32, ny: f32, nz: f32,
     area: f32,
     px: f32, py: f32, pz: f32,
-    _pad: f32,  // flatness ratio (0=flat, 1=sphere)
+    _pad: f32,   // s_i (surface-likeness, 0..1).  b_i = 1 - s_i.
 };
 
 struct OccUniforms {
     num_gaussians: u32,
     num_query_pts: u32,
-    flatness_threshold: f32,
-    gamma: f32,
+    _pad0: u32,
+    _pad1: u32,
 };
 
 @group(0) @binding(0) var<storage, read>       gaussians    : array<Gaussian>;
@@ -65,24 +73,30 @@ fn compute_occupancy(@builtin(global_invocation_id) gid: vec3<u32>) {
     if (q_idx >= occ_uniforms.num_query_pts) { return; }
 
     let q = query_pos_from_idx(q_idx);
-    var occ_raw = 0.0;
+
+    // Running product for the soft union  O = 1 - prod(1 - o_i).
+    // Saturates gracefully — multiple weak splats reinforce, but the result
+    // can never exceed 1 and accumulation costs no extra GPU primitives.
+    var occ_product = 1.0;
 
     for (var i = 0u; i < occ_uniforms.num_gaussians; i++) {
         let sp = precomputed[i];
+        let s_i = sp._pad;
+        let b_i = 1.0 - s_i;        // blob-likeness in [0,1]
 
-        // only fat splats contribute to occupancy
-        if (sp._pad <= occ_uniforms.flatness_threshold) { continue; }
+        // Pure-disk splats contribute nothing here (b_i = 0).  Skip for speed.
+        if (b_i < 1e-4) { continue; }
 
         let p = vec3<f32>(sp.px, sp.py, sp.pz);
         let d = q - p;
 
-        // early distance cull (skip if very far — beyond 6 sigma in any axis)
+        // Coarse early distance cull (units of world space, conservative).
         let dist2 = dot(d, d);
         if (dist2 > 100.0) { continue; }
 
         let g = gaussians[i];
 
-        // unpack scale and rotation from raw Gaussian
+        // Unpack scale & rotation from the raw Gaussian.
         let s1 = unpack2x16float(g.scale[0]);
         let s2 = unpack2x16float(g.scale[1]);
         let scale = exp(vec3<f32>(s1.x, s1.y, s2.x));
@@ -92,20 +106,25 @@ fn compute_occupancy(@builtin(global_invocation_id) gid: vec3<u32>) {
         let rot = normalize(vec4<f32>(r1.x, r1.y, r2.x, r2.y));
         let R = quat_to_mat(rot);
 
-        // Mahalanobis distance: ||diag(1/s) * R^T * d||^2
+        // Mahalanobis distance:  ||diag(1/s) · R^T · d||²
         let local_d = transpose(R) * d;
-        let scaled = local_d / scale;
+        let scaled  = local_d / scale;
         let maha_sq = dot(scaled, scaled);
 
-        // skip if too far in Mahalanobis space
-        if (maha_sq > 25.0) { continue; }
+        // 3-sigma support cutoff (efficiency only, not a tunable parameter).
+        if (maha_sq > 9.0) { continue; }
 
-        // opacity weight
+        // Trained opacity.
         let cd = unpack2x16float(g.pos_opacity[1]);
-        let opacity = 1.0 / (1.0 + exp(-cd.y));
+        let alpha_i = 1.0 / (1.0 + exp(-cd.y));
 
-        occ_raw += opacity * exp(-0.5 * maha_sq);
+        // o_i(x) ∈ [0, 1] — bounded membership, NOT a normalized density.
+        let o_i = clamp(alpha_i * b_i * exp(-0.5 * maha_sq), 0.0, 1.0);
+
+        // Accumulate the soft union as a running product of complements.
+        occ_product *= (1.0 - o_i);
     }
 
-    occ_values[q_idx] = 1.0 - exp(-occ_uniforms.gamma * occ_raw);
+    // O(x) = 1 - prod(1 - o_i)  →  bounded in [0,1] by construction.
+    occ_values[q_idx] = 1.0 - occ_product;
 }

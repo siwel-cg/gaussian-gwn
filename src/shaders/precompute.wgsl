@@ -119,13 +119,18 @@ fn precompute(@builtin(global_invocation_id) gid: vec3<u32>) {
     // disk area from the two larger eigenvalues
     let area = 3.14159265 * sqrt(max(0.0, ev.y) * max(0.0, ev.z));
 
-    // flatness ratio: 0 = perfectly flat disk, 1 = sphere
-    let flatness = sqrt(ev.x / max(ev.y, 1e-12));
+    // surface-likeness score: s_i = 1 - sigma3 / sigma2.
+    //   s_i ~ 1  → planar (disk-like)  → contributes to W (winding) field
+    //   s_i ~ 0  → isotropic (blob)    → contributes to O (occupancy) field
+    // ev is sorted ascending, so ev.x = sigma3, ev.y = sigma2, ev.z = sigma1.
+    // No threshold; every splat contributes continuously to BOTH fields with
+    // weights s_i and b_i = 1 - s_i.
+    let s_i = clamp(1.0 - ev.x / max(ev.y, 1e-12), 0.0, 1.0);
 
     precomputed[idx] = PrecomputedSplat(
         normal.x, normal.y, normal.z,
         area,
         pos.x, pos.y, pos.z,
-        flatness
+        s_i
     );
 }

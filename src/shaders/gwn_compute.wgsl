@@ -1,17 +1,31 @@
+// gwn_compute.wgsl — Surface (W) field via generalized winding number.
+//
+// Every splat contributes continuously, weighted by alpha_i * s_i, where
+//   s_i = 1 - sigma3/sigma2  (precomputed in PrecomputedSplat._pad)
+// is the surface-likeness score.  Planar splats dominate; isotropic blobs
+// contribute almost nothing to W.  No hard threshold.
+//
+// Final W is clamped to [0,1] (W_tilde) so that fusion sees a bounded value.
+
 override workgroupSize: u32 = 64;
 
-// THIS IS THE STUFF FROM THE PRECOMPUTE SHADER  
+struct Gaussian {
+    pos_opacity: array<u32, 2>,
+    rot:         array<u32, 2>,
+    scale:       array<u32, 2>,
+};
+
 struct PrecomputedSplat {
     nx: f32, ny: f32, nz: f32,
     area: f32,
     px: f32, py: f32, pz: f32,
-    _pad: f32,
+    _pad: f32,   // s_i (surface-likeness, 0..1)
 };
 
 struct GWNUniforms {
     num_gaussians: u32,
     num_query_pts: u32,
-    flatness_threshold: f32,
+    _pad0: u32,
     _pad1: u32,
 };
 
@@ -21,6 +35,7 @@ struct GWNUniforms {
 @group(0) @binding(3) var<uniform>             bb_min       : vec4<f32>;
 @group(0) @binding(4) var<uniform>             bb_max       : vec4<f32>;
 @group(0) @binding(5) var<uniform>             grid_res     : vec4<u32>;
+@group(0) @binding(6) var<storage, read>       gaussians    : array<Gaussian>;
 
 fn query_pos_from_idx(idx: u32) -> vec3<f32> {
     let rx = grid_res.x;
@@ -48,9 +63,16 @@ fn compute_gwn(@builtin(global_invocation_id) gid: vec3<u32>) {
 
     for (var i = 0u; i < gwn_uniforms.num_gaussians; i++) {
         let s = splats[i];
+        let s_i = s._pad;  // surface-likeness in [0,1]
 
-        // skip fat (interior) splats — they contribute to occupancy field instead
-        if (s._pad > gwn_uniforms.flatness_threshold) { continue; }
+        // Skip pure-blob splats outright (s_i = 0 contributes nothing anyway).
+        // This is an early-out for efficiency, NOT a hand-tuned cutoff.
+        if (s_i < 1e-4) { continue; }
+
+        // Read trained opacity (alpha_i) from raw Gaussian buffer.
+        let g  = gaussians[i];
+        let cd = unpack2x16float(g.pos_opacity[1]);
+        let alpha_i = 1.0 / (1.0 + exp(-cd.y));
 
         let p      = vec3<f32>(s.px, s.py, s.pz);
         let normal = vec3<f32>(s.nx, s.ny, s.nz);
@@ -61,8 +83,15 @@ fn compute_gwn(@builtin(global_invocation_id) gid: vec3<u32>) {
         if (dist2 < 1e-8) { continue; }
         let dist3 = dist2 * sqrt(dist2);
 
-        winding += (area / (4.0 * 3.14159265)) * dot(diff, normal) / dist3;
+        // W_i(x) = (area / 4π) · ⟨p - q, n⟩ / ||p - q||³
+        let w_i = (area / (4.0 * 3.14159265)) * dot(diff, normal) / dist3;
+
+        // Weighted by alpha_i * s_i  →  only surface-like, opacity-supported splats matter.
+        winding += alpha_i * s_i * w_i;
     }
 
-    gwn_values[q_idx] = winding;
+    // W_tilde(x) = clamp(W, 0, 1).  This is a modeling prior: the field is a
+    // soft inside-indicator, not a topological invariant.  Overshoots from
+    // overlapping splats are not real interior mass.
+    gwn_values[q_idx] = clamp(winding, 0.0, 1.0);
 }
